@@ -7,5 +7,5 @@ A separate application for the input data must be obtained via https://oxfordbrc
 
 ### Subdirectories
 - chapter_2: markdowns and utilities/function scripts for analyses performed in Chapter 2: The impact of baseline antibiotic activity on patient outcomes for bacteraemia caused by Enterobacterales species and E. coli.
-- chapter_3: markdowns and utilities/function scripts for analyses performed in Chapter 3: Sepsis phenotyping and response groups using EHR data
+- chapter_3: markdowns and utilities/function scripts for analyses performed in Chapter 3: Sepsis phenotyping and response groups using EHR data. Note that Seymour et al.'s external model must be obtained directly from their team. 
 - chapter_4: markdowns and utilities/function scripts for analyses performed in Chapter 4: Application of marginal structural models to estimate causal effects of antibiotic activity in E. coli & Enterobacterales bacteraemias
