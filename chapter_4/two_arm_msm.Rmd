@@ -1,0 +1,1440 @@
+---
+title: "two_arm_msm"
+author: "Chang Ho Yoon"
+date: "12/01/2024"
+output: html_document
+---
+
+This markdown details the treatment weight model decisions for emulation of
+the 2-arm target trial. As detailed below, the same script may be used
+for a high-resistance breakpoint definition for amoxicillin-clavulanate in
+E. coli bacteraemia, and also for Enterobacterales bacteraemia by switching
+the loaded dataframe or not filtering to E. coli (from the loaded Enterobacterales
+dataframe).
+
+```{r setup, include=FALSE}
+# load dependencies
+if (!require("pacman")) install.packages("pacman")
+library(pacman)
+
+pacman::p_load(
+  tidyverse,    # data management + ggplot2 graphics
+  ggthemes,     # expansion pack for ggplot2
+  cowplot,      # another expansion pack for ggplot2
+  patchwork,    # facet grid
+  scales,       # scale functions for ggplot2 visualisation
+  stringr,      # manipulate text strings 
+  purrr,        # loop over objects in a tidy way
+  glue,         # R's version of f-strings
+  lubridate,    # time / date objects
+  assertr,      # assert functions
+  gtsummary,    # publication-qual. tables 
+  
+  # survival and other regression analyses
+  lmtest,       # likelihood-ratio tests
+  effectsize,   # utilities to work with indices of effect sizes for variety of models
+  survival,     # classic survival analysis package, KM, Cox, etc.
+  survminer,    # to draw survival graphs (publication-ready)
+  boot,         # bootstrapping functions
+  splines,      # fitting splines
+  AICcmodavg,    # calculating AIC/AICc for model selection etc.
+  survey,       # weighted analyses
+  sandwich,     # sandwich estimator
+  
+  # specific causal inference packages
+  ipw,          # IPW calculating package ### NO LONGER MAINTAINED FROM 2021 ###
+  WeightIt     # another IPW-calculating package
+  )
+
+# create additional custom commands
+`%notin%` <- Negate(`%in%`)
+`%notwithin%` <- Negate(`%within%`)
+`%+%` <- ggplot2::`%+%`
+
+# import functions
+source("utils/CAUSAL_utils.R")
+```
+
+#import data
+This may be either:
+- the Enterobacterales dataframe where resistance is defined 
+by EUCAST breakpoints or...
+- the dataframe where resistance is defined by 
+high-resistance breakpoints for amoxicillin-clavulanate [>32/2 mg/L].
+
+```{r}
+###### EDIT according to user's own location of data ######
+entero_df = read_csv('#####/#####.csv', 
+                     guess_max = 1e6, 
+                     show_col_types = FALSE) 
+
+# E. coli cases 
+### this filtering step may be skipped in 2-arm MSM modelling for Enterobacterales
+ecoli_df = entero_df %>% filter(`E. coli` == 1)
+ecoli_df$id <- 1:nrow(ecoli_df)
+
+ecoli_cases <- ecoli_df %>%
+  select(id, ClusterID, SpellID, NewCulturePeriodNumber, ActiveBaseline) %>%
+  distinct() 
+
+# outcomes df
+outcomes_df = entero_df %>%
+  select(ClusterID, SpellID, CensorStatus_day14, OS_14, Followup_outcome_day14, 
+         in_hospital_death_day14, out_of_hospital_death_day14)
+
+deaths = ecoli_cases %>% select(id, ClusterID, SpellID) %>%
+  left_join(outcomes_df, by=c('ClusterID', 'SpellID')) %>% 
+  select(id, LinkedDeathdateAdjusted, LinkedDeathdate_v_adm) %>% distinct()
+```
+
+
+#Load analysis data frames
+*make outcome model df*
+```{r}
+# set variables
+labs_var = c('crp', 'albumin', 'alkaline_phosphatase', 'urea', 'monocytes', 'neutrophils', 'immature_granulocytes')
+labs_var_base = paste0(labs_var, '_base')
+
+obs_var = c('AVPU', 'SupplementaryOxygen', 'OxygenSaturation',
+            # following obs not in original Cox model
+            'HeartRate', 'SBP', 'RespiratoryRate', 'Temperature')
+obs_var_base = paste0(obs_var, '_base')
+
+###### EDIT according to user's own location of data ######
+# should be truncated already (as per methods)
+df_full <- read_csv('#####/#####.csv', guess_max=1e6,
+                        show_col_types = FALSE)
+
+# complete cases
+df_baseline = df_full %>% filter(time==0)
+df_base_comp = df_baseline[complete.cases(df_baseline),]
+
+# ids of complete cases
+comp_ids = df_base_comp %>% distinct(id) %>% .$id
+
+# analysis df of complete cases
+df_complete = df_full %>% filter(id %in% comp_ids)
+
+# identify cases receiving active treatment at baseline vs. not
+ec.never.id = df_complete %>% group_by(id) %>% filter(all(treat_up == 0)) %>% ungroup() %>% distinct(id) %>% .$id
+ec.inactive.base.id = df_complete %>% group_by(id) %>% filter(!any(treat_up == 1 & time == 0)) %>% ungroup() %>% distinct(id) %>% .$id
+ec.post.active.id = df_complete %>% group_by(id) %>% filter(any(treat_up == 1 & time > 0) & !any(treat_up == 1 & time == 0)) %>% ungroup() %>% distinct(id) %>% .$id
+ec.active.base.id = df_complete %>% group_by(id) %>% filter(any(treat_up == 1 & time == 0)) %>% ungroup() %>% distinct(id) %>% .$id
+
+length(ec.never.id) + length(ec.post.active.id) + length(ec.active.base.id) == length(comp_ids)
+
+# scale variables for improved interpretability
+outcome.model.df <- df_complete %>%
+  mutate(AgeAtAdmission = AgeAtAdmission / 10,
+         BMI = BMI / 10,
+         alkaline_phosphatase = (alkaline_phosphatase + 1e-10) / 100,
+         alkaline_phosphatase_base = (alkaline_phosphatase_base + 1e-10) / 100,
+         crp = (crp + 1e-10) / 10,
+         crp_base = (crp_base + 1e-10) / 10) 
+
+head(outcome.model.df, 3)
+```
+
+
+*unadjusted KM time to death by baseline activity*
+```{r, fig.height=5, fig.width=11}
+# unadjusted KM
+km_df = ecoli_df %>%
+  filter(id %in% outcome.model.df$id) %>%
+  mutate(active_baseline = case_when(id %in% ec.active.base.id ~ 1, TRUE ~ 0)) %>%
+  mutate(active_baseline = factor(active_baseline, levels = c(1, 0 ))) %>%
+  select(id, OverallSurvival_days, CensorStatus_day14, active_baseline) %>%
+  mutate(surv = case_when(OverallSurvival_days > 14 ~ 14, TRUE ~ OverallSurvival_days)) 
+  
+fit <- survfit(Surv(surv, CensorStatus_day14) ~ active_baseline, data = km_df)
+
+# plot with custom timeline on x-axis
+km_plot <- ggsurvplot(fit, data = km_df, 
+           risk.table=TRUE, fontsize =1,
+           ylim=c(0.85, 1),
+           xlab = "time intervals",
+           break.x.by = 0.25,
+           pval = TRUE, pval.coord = c(13, 0.95), pval.size = 3.5, conf.int = FALSE,
+           legend = "none",
+           legend.labs = c("Active", "Inactive")
+           )
+
+tab <- km_plot$table
+tab$layers = NULL # clear labels
+tab <- tab + 
+  geom_text(aes(x = time, y = rev(strata)), data = tab$data[tab$data$time %in% c(0, 0.5, 1, 1.5, 2, 3, 4, 5, 6,7,8,9,10,11,12,13, 14),], size=3) +
+  scale_x_continuous(limits = c(0, 14), breaks = c(0, 0.5, 1, 1.5, 2, 3, 4, 5, 6,7,8,9,10,11,12,13, 14),
+                     labels = c('0','2','4','6','8','9','10','11','12','13','14','15','16','17','18','19', '20')) +
+  labs(y = '')
+
+km_ggplot <- km_plot$plot +
+  scale_x_continuous(limits = c(0, 14), breaks = c(0, 0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 3, 4, 5, 6,7,8,9,10,11,12,13, 14),
+                     labels = c('0','1','2','3','4','5','6','7','8','9','10','11','12','13','14','15','16','17','18','19', '20'))
+
+km_plot$plot <- km_ggplot
+km_plot$table <- tab
+
+plotp = cowplot::plot_grid(km_plot$plot, km_plot$table,align = "v",ncol =1,rel_heights = c(4,2))
+plotp
+```
+
+
+
+*spline for time - OUTCOME MODEL*
+```{r}
+spline.df = outcome.model.df %>% 
+  mutate(treat_up = as.numeric(as.character(treat_up)))
+```
+
+```{r}
+# alternatively consider baseline period as another period when treatment decision is made
+s8 <- glm(formula =  death==1 ~ ns(time, knots = c(2, 4, 6, 8, 10, 12), Boundary.knots = c(1, 16)),
+                   data = spline.df, family = binomial(link = "logit"))
+
+s7 <- glm(formula = death==1 ~ ns(time, knots = c(2, 4, 6, 8, 12), Boundary.knots = c(1, 16)),
+                   data = spline.df, family = binomial(link = "logit"))
+
+s6 <- glm(formula = death==1 ~ ns(time, knots = c(2, 4, 8, 12), Boundary.knots = c(1, 16)),
+                   data = spline.df, family = binomial(link = "logit"))
+
+# treating time as a categorical variable:
+cat.time.df = spline.df %>%
+  mutate(time = factor(time, levels = c(seq(0,19,1))))
+
+cat <- glm(formula = death==1 ~ time,
+                   data = cat.time.df, family = binomial(link = "logit"))
+
+```
+
+Visual inspection:
+```{r, fig.height=5, fig.width=9}
+K=20 # no. of time windows
+options(warn=-1) # Suppress warning messages
+
+new_df = expand.grid(treat_up = mean(spline.df$treat_up),
+                     time = factor(seq(0, 19, 1)))
+
+new_df$predict = predict(cat, newdata = new_df, type='response')
+new_df$se = predict(cat, newdata = new_df, type='response', se.fit=TRUE)$se.fit
+new_df <- new_df %>%
+  mutate(
+         ul = predict + 1.96*se,
+         ll = predict - 1.96*se)
+
+
+new_df_2 = expand.grid(treat_up = mean(spline.df$treat_up),
+                     time = seq(0, 19, 1))
+
+new_df_2$s8 = predict(s8, newdata = new_df_2, type='response')
+new_df_2$s7 = predict(s7, newdata = new_df_2, type='response')
+new_df_2$s6 = predict(s6, newdata = new_df_2, type='response')
+
+spline.s8 <- as.data.frame(spline(new_df_2$time, new_df_2$s8, n=100))
+spline.s7 <- as.data.frame(spline(new_df_2$time, new_df_2$s7, n=100))
+spline.s6 <- as.data.frame(spline(new_df_2$time, new_df_2$s6, n=100))
+
+ggplot() +
+  geom_pointrange(data=new_df, aes(x=time, y=predict, ymin=ll, ymax=ul)) +
+  geom_line(data = spline.s8, aes(x=x+1, y=y), color = "#E69F00") +
+  geom_line(data=spline.s7, aes(x=x+1, y=y), color="#56B4E9") +
+  geom_line(data=spline.s6, aes(x=x+1, y=y), color="#CC79A7") +
+  labs(x = 'time intervals',
+       y = "probability",
+       title = paste("orange = 8 knots, blue = 7 knots, pink = 6 knots, boundaries at 1 & 16")) +
+  theme_light()
+options(warn=-0)
+```
+
+
+# Time-updated treatment effect estimates
+a. no treatment weights 
+b. no treatment weights + strictly baseline var adjustment in outcome model
+c. IPTW 
+d. IPTW + baseline var adjustment in outcome model
+
+
+### a. no treatment weights + no baseline variable adjustment in outcome model
+*spline knots for outcome model*
+
+```{r}
+# splines for variables
+# cases post time=0 because in outcome model, nobody dies at time=0 (in this E. coli cohort)
+outcome_df = outcome.model.df %>% filter(time != 0)
+
+# code to generate quantiles (for splines) for continuous variables
+other_cont = c('AgeAtAdmission', 'BMI', 'news_score', 'news_score_base')
+cont_vars = c(labs_var, obs_var[obs_var %notin% c('AVPU', 'SupplementaryOxygen')],
+              labs_var_base, obs_var_base[obs_var_base %notin% c('AVPU_base', 'SupplementaryOxygen_base')], 
+              other_cont)
+
+var_quants = list()
+for (i in seq_along(cont_vars)){
+  var = cont_vars[[i]]
+  var_str = as.character(var)
+
+  qs = unname(quantile(outcome_df[[var]], probs = c(0.1, 0.5, 0.9)))
+  
+  var_quants[[var_str]] <- qs
+  
+}
+```
+
+Fit treat_up as time-updated treatment variable
+```{r}
+options(warn=-1) # Suppress warning messages
+no.wt.fit <- glm(formula = death==1 ~ treat_up + ns(time, knots = c(2, 4, 6, 8, 12), Boundary.knots = c(1, 16)),
+                 family = binomial(link = 'logit'),
+                 data = outcome_df)
+
+# Print results 
+summary(no.wt.fit)
+
+exp(cbind(OR = coef(no.wt.fit), confint(no.wt.fit)))
+
+robust_se(no.wt.fit)
+options(warn=-0) 
+```
+
+
+###b. no treatment weights + baseline adjustment in outcome model
+*check log likelihood of spline terms*
+```{r}
+# log likelihoods for spline in outcome model
+nonlin_vars = c("AgeAtAdmission", "albumin_base", "alkaline_phosphatase_base",
+                "BMI", "crp_base", "immature_granulocytes_base", "monocytes_base", 
+                "neutrophils_base", "news_score_base", "urea_base")
+
+lin_vars = c(varlist, newvars)
+lin_vars = lin_vars[lin_vars %notin% nonlin_vars]
+
+lin.out.form = as.formula(paste0('death==1 ~ (treat_up + ns(time, knots = c(2, 4, 6, 8, 12), Boundary.knots = c(1, 16))  + ',
+                                 paste(lin_vars, collapse = " + "), ' + ',
+                                 paste(nonlin_vars, collapse = " + "),')'))
+
+# loop through non-linear terms
+for(i in seq_along(nonlin_vars)){
+  var = nonlin_vars[i]
+  other_vars = c(nonlin_vars, lin_vars)
+  other_vars = other_vars[other_vars %notin% c(var)]
+  
+  new.form = as.formula(paste0('death==1 ~ (treat_up + ns(time, knots = c(2, 4, 6, 8, 12), Boundary.knots = c(1, 16))  + ',
+                                 paste(other_vars, collapse = " + "), ' + ',
+                                 paste0("ns(",var,", knots = var_quants[['", var, "']])"),")"))
+  
+  # print(new.form)
+  old = glm(lin.out.form, data = outcome_df, family = binomial(link = "logit"))
+  new = glm(new.form, data = outcome_df, family = binomial(link = 'logit'))
+  
+  result = lrtest(old, new)[2, 5][[1]]
+  
+  print(paste("spline LL test for", var, "is:", as.character(result)))
+  
+}
+```
+
+
+*using original formula + linear terms for new variables*
+- from baseline model in Chapter 2 (baseline treatment activity models)
+```{r}
+options(warn=-1) # Suppress warning messages
+# outcome model with original baseline variables only
+extra.adj.no.wt.orig <- glm(formula = death==1 ~ treat_up + ns(time, knots = c(2, 4, 6, 8, 12), Boundary.knots = c(1, 16))
+                + AgeAtAdmission + BMI + immunosuppression + PriorHospitalisation + Specialty 
+                + AVPU_base + OxygenSaturation_base + SupplementaryOxygen_base 
+                + albumin_base + alkaline_phosphatase_base + urea_base
+                + monocytes_base + immature_granulocytes_base
+                + I((neutrophils_base/10)^-0.5)
+                ,
+
+                 family = binomial(link = 'logit'),
+                 data = outcome_df)
+
+# outcome model including new baseline variables
+extra.adj.no.wt.new <- glm(formula = death==1 ~ treat_up + ns(time, knots = c(2, 4, 6, 8, 12), Boundary.knots = c(1, 16))
+                + AgeAtAdmission + BMI + immunosuppression + PriorHospitalisation + Specialty 
+                + AVPU_base + OxygenSaturation_base + SupplementaryOxygen_base 
+                + albumin_base + alkaline_phosphatase_base + urea_base
+                + monocytes_base + immature_granulocytes_base
+                + I((neutrophils_base/10)^-0.5)
+                + palliative_care_any 
+                + firstline_resist 
+                + urine_firstline_resist 
+                + news_score_base 
+                + crp_base 
+                     ,
+                 family = binomial(link = 'logit'),
+                 data = outcome_df)
+
+# print difference between models
+print(lrtest(extra.adj.no.wt.orig, extra.adj.no.wt.new)[2, 5][[1]])
+
+# Print results 
+summary(extra.adj.no.wt.new)
+
+exp(cbind(OR = coef(extra.adj.no.wt.new), confint(extra.adj.no.wt.new)))
+
+#robust se
+robust_se(extra.adj.no.wt.orig)  # with old variables only
+robust_se(extra.adj.no.wt.new)   # with new variables
+options(warn=-0) 
+```
+
+
+###c. IPTW - inverse probability of treatment weights
+
+####Treatment models
+```{r}
+# max follow-up time for post-baseline treatment escalation = when treatment escalation occurred
+switch_max_time = outcome.model.df %>%
+  filter(id %in% ec.post.active.id) %>%
+  filter(treat_up == 1) %>%
+  group_by(id) %>%
+  arrange(id, time) %>%
+  slice(1) %>%
+  mutate(max_tstop = tstop) %>%
+  dplyr::select(id, max_tstop)
+
+# in treatment model, keep:
+# 1) only 1st time row for active baseline
+# 2) only up to and incl. the time row when treatment escalation occurs
+# 3) all time rows for inactive baseline and not escalated
+
+treat.model.df = outcome.model.df %>%
+  left_join(switch_max_time, by='id') %>% distinct() %>%
+  filter(id %notin% ec.post.active.id | (id %in% ec.post.active.id & tstop <= max_tstop)) %>%
+  dplyr::select(-max_tstop) %>%
+  
+  mutate(include = case_when(id %in% ec.active.base.id & time == 0 ~ 1,
+                             id %notin% ec.active.base.id ~ 1,
+                             TRUE ~ 0)) %>%
+  filter(include == 1) %>% dplyr::select(-include)
+
+# convert tbl --> data.frame for compatibility 
+treat.model.df = as.data.frame(treat.model.df)
+```
+
+*see distributions of treatment escalation*
+```{r, fig.height = 5, fig.width = 8}
+n_switch = outcome.model.df %>%
+  filter(id %in% ec.post.active.id) %>% distinct(id) %>% nrow(.)
+
+n_inact_base = outcome.model.df %>%
+  filter(id %notin% ec.active.base.id) %>% distinct(id) %>% nrow(.)
+
+t_to_switch = outcome.model.df %>%
+  mutate(treat_up = as.numeric(as.character(treat_up))) %>%
+  filter(id %in% ec.post.active.id) %>%
+  filter(treat_up == 1) %>%
+  group_by(id) %>%
+  arrange(id, time) %>%
+  slice(1) %>%
+  mutate(max_tstop = tstart) %>%
+  
+  group_by(time) %>% summarise(sum = sum(treat_up)) %>%
+  rbind(c(15, 0)) %>% rbind(c(16, 0)) %>% rbind(c(17, 0)) %>% rbind(c(18,0)) %>% rbind(c(19,0)) %>%
+  ggplot(aes(x=time, y=sum)) + geom_bar(stat = 'identity', fill='steelblue') + 
+  labs(x = 'time intervals', y='n episodes with switch to active antibiotics' 
+       ) + 
+  theme(panel.background = element_blank(), 
+        panel.grid.major = element_line(colour = "grey95"))
+  
+t_to_switch
+```
+
+
+####IPTW: all Cox vars + last24h_crp_post24_3L + NEWS class + worsening NEWS Class
+- where NEWS Class = risk stratification (high, medium, low)
+*REMOVED highly-correlated vars (>=5): immature granulocytes, new_ooh_imm_gran, new_ooh_urea
+
+***ONLY UP TO TSTART = 10 DUE TO DATA SPARSITY after this interval***
+```{r}
+end_tstart = 10
+
+new.treat.df = treat.model.df %>%
+  filter(tstart <= end_tstart)
+```
+
+*spline for time - TREATMENT MODEL*
+```{r}
+# alternatively consider baseline period as another period when treatment decision is made
+s6 <- glm(formula = treat_up==1 ~ ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10)),
+                   data = new.treat.df, family = binomial(link = "logit"))
+
+s5 <- glm(formula = treat_up==1 ~ ns(time, knots = c(2, 3, 8), Boundary.knots = c(1, 9)),
+                   data = new.treat.df, family = binomial(link = "logit"))
+
+# treating time as a categorical variable:
+cat.time.df = new.treat.df %>%
+  mutate(time = factor(time, levels = c(seq(0,10,1))))
+
+cat <- glm(formula = treat_up==1 ~ time,
+                   data = cat.time.df, family = binomial(link = "logit"))
+
+```
+
+Visual inspection
+```{r, fig.height = 10, fig.width =8}
+K=20 # no. of time windows
+options(warn=-1) # Suppress warning messages
+
+new_df = expand.grid(treat_up = mean(new.treat.df$treat_up),
+                     time = factor(seq(0, 10, 1)))
+
+new_df$predict = predict(cat, newdata = new_df, type='response')
+new_df$se = predict(cat, newdata = new_df, type='response', se.fit=TRUE)$se.fit
+new_df <- new_df %>%
+  mutate(prob = predict,
+         ul = prob + 1.96*se,
+         ll = prob- 1.96*se)
+
+
+new_df_2 = expand.grid(treat_up = mean(new.treat.df$treat_up),
+                     time = seq(0, 10, 1))
+
+new_df_2$s6 = predict(s6, newdata = new_df_2, type='response')
+new_df_2$s5 = predict(s5, newdata = new_df_2, type='response')
+
+spline.s6 <- as.data.frame(spline(new_df_2$time, new_df_2$s6, n=100))
+spline.s5 <- as.data.frame(spline(new_df_2$time, new_df_2$s5, n=100))
+
+treat_model_tspline = ggplot() + 
+  geom_pointrange(data=new_df, aes(x=time, y=prob, ymin=ll, ymax=ul)) +
+  geom_line(data=spline.s6, aes(x=x+1, y=y), color='#E69F00') +
+  geom_line(data=spline.s5, aes(x=x+1, y=y), color='#56B4E9') +
+  labs(x = 'time intervals',
+       y = "probability") +
+  theme_light()
+options(warn=-0) 
+    
+t_to_switch / treat_model_tspline
+```
+
+
+*obtain knot values for continuous variables*
+```{r}
+# code to generate splines for continuous variables
+other_cont = c('AgeAtAdmission', 'BMI', 'news_score', 'news_score_base')
+cont_vars = c(labs_var, obs_var[obs_var %notin% c('AVPU', 'SupplementaryOxygen')],
+              labs_var_base, obs_var_base[obs_var_base %notin% c('AVPU_base', 'SupplementaryOxygen_base')], 
+              other_cont)
+
+var_quants = list()
+for (i in seq_along(cont_vars)){
+  var = cont_vars[[i]]
+  var_str = as.character(var)
+
+  qs = unname(quantile(new.treat.df[[var]], probs = c(0.1, 0.5, 0.9)))
+  
+  var_quants[[var_str]] <- qs
+  
+}
+```
+
+
+*check log likelihood of spline terms*
+```{r}
+# DENOMINATOR model
+# time-updated vars
+lin_vars_t = c("PriorHospitalisation", "immunosuppression", "Specialty", "SupplementaryOxygen", 
+               "OxygenSaturation", "AVPU", "palliative_care_any",
+               "firstline_resist", "urine_firstline_resist", "last24h_crp_post24_3L", "worsening_news_class")
+nonlin_vars_t = c("AgeAtAdmission", "albumin", "alkaline_phosphatase", "BMI", "crp", 
+                  # "immature_granulocytes", ### evidence of collinearity with neutrophils 
+                  "monocytes", "neutrophils", "news_score", "urea")
+
+# linear formulae for treatment model
+lin.out.form = as.formula(paste0('treat_up ~ ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10)) + ',
+                                 paste(lin_vars_t, collapse = " + "), ' + ',
+                                 paste(nonlin_vars_t, collapse = " + ")))
+
+# loop through non-linear terms
+for(i in seq_along(nonlin_vars_t)){
+  var = nonlin_vars_t[i]
+  other_vars = c(nonlin_vars_t, lin_vars_t)
+  other_vars = other_vars[other_vars %notin% c(var)]
+  
+  new.form = as.formula(paste0('treat_up ~ ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))  + ',
+                                 paste(other_vars, collapse = " + "), ' + ',
+                                 paste0("ns(",var,", knots = var_quants[['", var, "']])")))
+  
+  # print(new.form)
+  old = glm(lin.out.form, data = new.treat.df, family = binomial(link = "logit"))
+  new = glm(new.form, data = new.treat.df, family = binomial(link = 'logit'))
+  
+  result = lrtest(old, new)[2, 5][[1]]
+  
+  print(paste("spline LL test for", var, "is:", as.character(result)))
+  
+}
+```
+
+
+```{r}
+# NOMINATOR model
+
+# time-static vars
+nonlin_vars = c("AgeAtAdmission", "albumin_base", "alkaline_phosphatase_base", "BMI", "crp_base", 
+                # "immature_granulocytes_base", ### evidence of collinearity with neutrophils
+                "monocytes_base", "neutrophils_base", "news_score_base", "urea_base")
+
+lin_vars = c(varlist, newvars, "firstline_resist", "urine_firstline_resist")
+lin_vars = lin_vars[lin_vars %notin% nonlin_vars]
+
+# linear formulae for treatment model
+lin.out.form = as.formula(paste0('treat_up ~ ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10)) + ',
+                                 paste(lin_vars, collapse = " + "), ' + ',
+                                 paste(nonlin_vars, collapse = " + ")))
+
+# loop through non-linear terms
+for(i in seq_along(nonlin_vars)){
+  var = nonlin_vars[i]
+  other_vars = c(nonlin_vars, lin_vars)
+  other_vars = other_vars[other_vars %notin% c(var)]
+  
+  new.form = as.formula(paste0('treat_up ~ ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))  + ',
+                                 paste(other_vars, collapse = " + "), ' + ',
+                                 paste0("ns(",var,", knots = var_quants[['", var, "']])")))
+  
+  # print(new.form)
+  old = glm(lin.out.form, data = new.treat.df, family = binomial(link = "logit"))
+  new = glm(new.form, data = new.treat.df, family = binomial(link = 'logit'))
+  
+  result = lrtest(old, new)[2, 5][[1]]
+  
+  print(paste("spline LL test for", var, "is:", as.character(result)))
+  
+}
+```
+
+
+####Treatment model comparisons
+##### - orig vars [splines on LL]
+based on log likelihood Wald p<0.05, monocytes_base, monocytes, (news)
+```{r}
+# reset spline knots for treatment model
+var_quants = list()
+for (i in seq_along(cont_vars)){
+  var = cont_vars[[i]]
+  var_str = as.character(var)
+
+  qs = unname(quantile(new.treat.df[[var]], probs = c(0.1, 0.5, 0.9)))
+  
+  var_quants[[var_str]] <- qs
+  
+}
+
+# numerator model
+model_num <- glm(treat_up ~ ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10)) 
+                 + AgeAtAdmission + BMI + immunosuppression 
+                 + PriorHospitalisation + Specialty + albumin_base
+                 + urea_base + neutrophils_base 
+                 + AVPU_base + SupplementaryOxygen_base 
+                 + OxygenSaturation_base + alkaline_phosphatase_base
+                 + ns(monocytes_base, knots = var_quants$monocytes_base)
+                   ,
+                 data = new.treat.df, family = binomial(link = "logit"))
+
+# denominator model
+model_denom <- glm(treat_up ~ ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10)) 
+                   + AgeAtAdmission + BMI + immunosuppression 
+                   + PriorHospitalisation + Specialty + albumin 
+                   + urea + neutrophils 
+                   + AVPU + SupplementaryOxygen
+                   + OxygenSaturation + alkaline_phosphatase
+                   + ns(monocytes, knots = var_quants$monocytes)
+                   ,
+                   data = new.treat.df, family = binomial(link = "logit"))
+
+# compute IPTW
+iptw_manual <- compute_iptw(new.treat.df, model_num, model_denom)
+
+iptw_manual %>% select(ipw_manual) %>% summary(.)
+paste0("sd: ", sd(iptw_manual$ipw_manual))
+
+end_tstart = 10
+
+# add weights to person-time data
+iptw_link = iptw_manual %>%
+  # only cases to time <=10 due to data sparsity beyond
+  filter(tstart <= end_tstart) %>%
+  dplyr::select(id, time, ipw_manual) 
+
+treat_elig <- outcome.model.df %>%
+  left_join(iptw_link, by=c('id', 'time')) %>%
+  group_by(id) %>%
+  arrange(id, time) %>%
+  fill(ipw_manual, .direction = 'down') %>% ungroup()
+```
+
+```{r}
+# ELIGIBLE cases i.e., post time=0 because in outcome model, nobody dies at time=0
+outcome_df = treat_elig %>% filter(time != 0)
+outcome_df = data.frame(outcome_df)
+
+# code to generate splines for continuous variables
+other_cont = c('AgeAtAdmission', 'BMI', 'news_score', 'news_score_base')
+cont_vars = c(labs_var, obs_var[obs_var %notin% c('AVPU', 'SupplementaryOxygen')],
+              labs_var_base, obs_var_base[obs_var_base %notin% c('AVPU_base', 'SupplementaryOxygen_base')], other_cont)
+
+var_quants = list()
+for (i in seq_along(cont_vars)){
+  var = cont_vars[[i]]
+  var_str = as.character(var)
+
+  qs = unname(quantile(outcome_df[[var]], probs = c(0.1, 0.5, 0.9)))
+  
+  var_quants[[var_str]] <- qs
+  
+}
+```
+
+*Fit outcome model with IPTW*
+```{r}
+options(warn=-1) # Suppress warning messages
+try.wt.fit <- glm(formula = death==1 ~ treat_up + ns(time, knots = c(2, 4, 6, 8, 12), Boundary.knots = c(1, 16))
+                ,family = binomial(link = 'logit'),
+                data = outcome_df,
+                weights = ipw_manual
+                )
+
+robust_se(try.wt.fit)
+options(warn=-0) 
+```
+
+
+
+##### - orig+new vars [splines on LL]
+```{r}
+# reset spline knots for treatment model
+var_quants = list()
+for (i in seq_along(cont_vars)){
+  var = cont_vars[[i]]
+  var_str = as.character(var)
+
+  qs = unname(quantile(new.treat.df[[var]], probs = c(0.1, 0.5, 0.9)))
+  
+  var_quants[[var_str]] <- qs
+  
+}
+
+model_num <- glm(treat_up ~ ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10)) 
+                 + AgeAtAdmission + BMI + immunosuppression 
+                 + PriorHospitalisation + Specialty + albumin_base
+                 + urea_base + neutrophils_base 
+                 + AVPU_base + SupplementaryOxygen_base 
+                 + OxygenSaturation_base + alkaline_phosphatase_base
+                 + ns(monocytes_base, knots = var_quants$monocytes_base)
+                 + palliative_care_any + firstline_resist + urine_firstline_resist 
+                 + news_score_base + crp_base
+                   ,
+                 data = new.treat.df, family = binomial(link = "logit"))
+
+model_denom <- glm(treat_up ~ ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10)) 
+                   + AgeAtAdmission + BMI + immunosuppression 
+                   + PriorHospitalisation + Specialty + albumin 
+                   + urea + neutrophils 
+                   + AVPU + SupplementaryOxygen
+                   + OxygenSaturation + alkaline_phosphatase
+                   + ns(monocytes, knots = var_quants$monocytes)
+                   + palliative_care_any + firstline_resist + urine_firstline_resist
+                   + ns(news_score, knots = var_quants$news_score) + worsening_news_class 
+                   + crp + last24h_crp_post24_3L
+                   ,
+                   data = new.treat.df, family = binomial(link = "logit"))
+
+# compute IPTW
+iptw_manual <- compute_iptw(new.treat.df, model_num, model_denom)
+
+iptw_manual %>% select(ipw_manual) %>% summary(.)
+paste0("sd: ", sd(iptw_manual$ipw_manual))
+
+end_tstart = 10
+
+# add weights to person-time data
+iptw_link = iptw_manual %>%
+  # only cases to time <=10 due to data sparsity beyond
+  filter(tstart <= end_tstart) %>%
+  dplyr::select(id, time, ipw_manual) 
+
+treat_elig <- outcome.model.df %>%
+  left_join(iptw_link, by=c('id', 'time')) %>%
+  group_by(id) %>%
+  arrange(id, time) %>%
+  fill(ipw_manual, .direction = 'down') %>% ungroup()
+```
+
+```{r}
+# ELIGIBLE cases i.e., post time=0 because in outcome model, nobody dies at time=0
+outcome_df = treat_elig %>% filter(time != 0)
+outcome_df = data.frame(outcome_df)
+
+# code to generate splines for continuous variables
+other_cont = c('AgeAtAdmission', 'BMI', 'news_score', 'news_score_base')
+cont_vars = c(labs_var, obs_var[obs_var %notin% c('AVPU', 'SupplementaryOxygen')],
+              labs_var_base, obs_var_base[obs_var_base %notin% c('AVPU_base', 'SupplementaryOxygen_base')], other_cont)
+
+var_quants = list()
+for (i in seq_along(cont_vars)){
+  var = cont_vars[[i]]
+  var_str = as.character(var)
+
+  qs = unname(quantile(outcome_df[[var]], probs = c(0.1, 0.5, 0.9)))
+  
+  var_quants[[var_str]] <- qs
+  
+}
+```
+
+```{r}
+options(warn=-1) # Suppress warning messages
+try.wt.fit <- glm(formula = death==1 ~ treat_up + ns(time, knots = c(2, 4, 6, 8, 12), Boundary.knots = c(1, 16))
+                ,family = binomial(link = 'logit'),
+                data = outcome_df,
+                weights = ipw_manual
+                )
+
+robust_se(try.wt.fit)
+options(warn=-0) 
+```
+
+
+
+#### Final treatment model (no interaction terms)
+
+```{r, fig.height = 8, fig.width = 12}
+# treatment model
+model_num <- glm(treat_up ~ ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10)) 
+                 + AgeAtAdmission + BMI + immunosuppression 
+                 + PriorHospitalisation + Specialty 
+                 + albumin_base + urea_base + neutrophils_base
+                 + alkaline_phosphatase_base
+                 + ns(monocytes_base, knots = var_quants$monocytes_base)
+                 + AVPU_base + OxygenSaturation_base + SupplementaryOxygen_base
+                 
+                 + palliative_care_any + firstline_resist + urine_firstline_resist 
+                 + news_score_base + crp_base
+                   ,
+                 data = new.treat.df, family = binomial(link = "logit"))
+
+model_denom <- glm(treat_up ~ ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))
+                   + AgeAtAdmission + BMI + immunosuppression 
+                   + PriorHospitalisation + Specialty 
+                   + albumin + urea + neutrophils 
+                   + alkaline_phosphatase
+                   + ns(monocytes, knots = var_quants$monocytes)  
+                   + AVPU + OxygenSaturation + SupplementaryOxygen
+                   
+                   + crp + last24h_crp_post24_3L
+                   + palliative_care_any + firstline_resist + urine_firstline_resist
+                   + ns(news_score, knots = var_quants$news_score)+ worsening_news_class
+                   ,
+                   data = new.treat.df, family = binomial(link = "logit"))
+
+# compute IPTW
+iptw_manual <- compute_iptw(new.treat.df, model_num, model_denom) %>%
+  mutate(base_treatment = case_when(treat_base == 1 ~ 'active',
+                                    treat_base == 0 ~ 'inactive'),
+         base_treatment = factor(base_treatment, levels = c('active', 'inactive')))
+
+iptw_manual %>% summary(.)
+
+# plot IPWs by time point
+iptw_means = compute_iptw_means(iptw_manual)
+
+p = plot_iptws(iptw_manual, iptw_means) +
+  scale_y_continuous(breaks = c(0, 1, 2, 3, 4, 5), limits = c(0, 5.5) ) +
+  labs(
+       x='time intervals', y='IPTW') +
+  theme_minimal()
+
+# plot IPWs by antibiotic activity
+p2 = ggplot(subset(iptw_manual, base_treatment == 'active'), 
+                       aes(x = propensity_denom, fill = base_treatment)) +
+                       geom_histogram(aes(y = ..density..), binwidth=0.01, show.legend=FALSE) + 
+                       geom_histogram(data = subset(iptw_manual, base_treatment == 'inactive'),
+                       aes(x = propensity_denom, y = - ..density.., fill = base_treatment), binwidth=0.01, show.legend=FALSE) + 
+                       ylab("Density (%)") + 
+                       xlab("probability of receiving active treatment") + 
+                       scale_fill_discrete(name = "Baseline antibiotic activity") +
+  scale_y_continuous(limits = c(-6, 8), breaks = seq(-6, 8, 2)) +
+  theme_minimal()
+
+p3 = ggplot(subset(iptw_manual, base_treatment == 'active'), 
+                       aes(x = ipw_manual, fill = base_treatment)) +
+                       geom_histogram(aes(y = ..density..), binwidth=0.01) + 
+                       geom_histogram(data = subset(iptw_manual, base_treatment == 'inactive'),
+                       aes(x = ipw_manual, y = - ..density.., fill = base_treatment), binwidth=0.01) + 
+                       ylab("Density (%)") + 
+                       xlab("IPTW") + 
+                       scale_fill_discrete(name = "Baseline antibiotic activity") +
+  theme_minimal()
+
+mean(iptw_manual$ipw_manual)
+sd(iptw_manual$ipw_manual)
+
+(p2 | p3) / p +
+  plot_annotation(tag_levels = 'A')
+```
+
+
+*check propensities at baseline*
+As they seem v discriminatory across all time intervals...
+- problem with balancing??
+```{r}
+iptw_base = iptw_manual %>% 
+  filter(time==0)
+
+ggplot(subset(iptw_base, base_treatment == 'active'), 
+                       aes(x = propensity_denom, fill = base_treatment)) +
+                       geom_histogram(aes(y = ..density..), binwidth=0.01, show.legend=FALSE) + 
+                       geom_histogram(data = subset(iptw_base, base_treatment == 'inactive'),
+                       aes(x = propensity_denom, y = - ..density.., fill = base_treatment), binwidth=0.01, show.legend=TRUE) + 
+                       ylab("Density (%)") + 
+                       xlab("probability of receiving active treatment at time=0") + 
+                       scale_fill_discrete(name = "Baseline antibiotic activity") +
+  theme_minimal()
+```
+
+
+```{r}
+end_tstart = 10
+
+# add weights to person-time data
+iptw_link = iptw_manual %>%
+  # only cases to time <=10 due to data sparsity beyond
+  filter(tstart <= end_tstart) %>%
+  dplyr::select(id, time, ipw_manual) 
+
+treat_elig <- outcome.model.df %>%
+  left_join(iptw_link, by=c('id', 'time')) %>%
+  group_by(id) %>%
+  arrange(id, time) %>%
+  fill(ipw_manual, .direction = 'down') %>% ungroup()
+
+# truncate stabilized weights
+threshold_99 <- quantile(treat_elig$ipw_manual, 0.99)
+threshold_1 <- quantile(treat_elig$ipw_manual, 0.01)
+treat_elig$sw_1_99 <- treat_elig$ipw_manual
+treat_elig = treat_elig %>% mutate(sw_1_99 = case_when(sw_1_99 > threshold_99 ~ threshold_99,
+                                                       sw_1_99 < threshold_1 ~ threshold_1,
+                                                       TRUE ~ sw_1_99))
+
+summary(treat_elig$ipw_manual)
+summary(treat_elig$sw_1_99)
+```
+
+*sanity check of IPWs using packages*
+Comparing manual and automated IPW calculations for the treatment model 
+with selected spline terms. 
+```{r}
+# ***USING PACKAGE***
+ipwtm.df = data.frame(new.treat.df)
+ipw_auto = ipwtm(
+   exposure = treat_up,
+   family = "binomial", link = "logit",
+   numerator = ~ ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10)) + AgeAtAdmission + BMI + immunosuppression + PriorHospitalisation + Specialty + palliative_care_any + firstline_resist + urine_firstline_resist + news_score_base + crp_base + albumin_base + urea_base + neutrophils_base + AVPU_base + OxygenSaturation_base + SupplementaryOxygen_base + alkaline_phosphatase_base + ns(monocytes_base, knots = var_quants$monocytes_base),
+   denominator = ~ ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10)) + AgeAtAdmission + BMI + immunosuppression + PriorHospitalisation + Specialty + palliative_care_any + firstline_resist + urine_firstline_resist + worsening_news_class + AVPU + OxygenSaturation + SupplementaryOxygen + albumin + urea + neutrophils + alkaline_phosphatase + ns(monocytes, knots = var_quants$monocytes) + ns(news_score, knots = var_quants$news_score) + crp + last24h_crp_post24_3L,
+   id = id,
+   type = "first",
+   timevar = time,
+   data = ipwtm.df)
+
+compare_iptw = iptw_manual %>%
+  select(id, time, ipw_manual) %>%
+  mutate(ipw_auto = ipw_auto$ipw.weights)
+head(compare_iptw,5)
+```
+
+
+
+#####Univariable and multivariable coefficients
+```{r}
+explanatory_vars = names(model.frame(model_denom))[-1:-2]
+time_var = names(model.frame(model_denom))[2]
+
+# compute estimates for each confounder variable
+univ_models = explanatory_vars %>%       # begin with variables of interest
+  str_c(paste0("treat_up ~ ", time_var, " + "), .) %>%
+  
+  map(                               
+    .f = ~glm(                       # pass the formulas one-by-one to glm()
+      formula = as.formula(.x),      # within glm(), the string formula is .x
+      family = binomial(link = 'logit'),           # specify type of glm (logistic)
+      data = treat.model.df)
+      %>% coeftest(., vcov = vcovCL, type = 'HC1', cluster = ~id) %>%
+      tidy(., conf.int = TRUE) %>%
+      mutate(OR = exp(estimate),
+         ll = exp(conf.low),
+         ul = exp(conf.high)) %>%
+      select(term, OR, ll, ul, everything()) %>%
+      filter(!grepl("time",term)) %>%
+      filter(!grepl("Intercept",term)) %>%
+      select(term, OR, ll, ul, p.value) %>%
+      mutate(across(.cols = c(OR, ll, ul, p.value), ~ round_half_up(.x, digits=3)))
+    )
+
+uni_treat_df = bind_rows(univ_models) %>%
+  mutate(CI_95 = str_c(ll, ', ', ul)) %>%
+  select(term, OR, CI_95, p.value)
+
+multi_treat_df = model_denom %>%
+  # lmtest with robust s.e. and Wald p as default
+  coeftest(., vcov = vcovCL, type = 'HC1', cluster = ~id) %>%
+  tidy(., conf.int = TRUE) %>%
+  mutate(OR = exp(estimate),
+     ll = exp(conf.low),
+     ul = exp(conf.high)) %>%
+  select(term, OR, ll, ul, everything()) %>%
+  filter(!grepl("time",term)) %>%
+  filter(!grepl("Intercept",term)) %>%
+  select(term, OR, ll, ul, p.value) %>%
+  mutate(across(.cols = c(OR, ll, ul, p.value), ~ round_half_up(.x, digits=3))) %>%
+  mutate(CI_95 = str_c(ll, ', ', ul)) %>%
+  select(term, OR, CI_95, p.value) %>%
+  rename("OR_multi" = "OR", "CI_95_multi" = "CI_95", "p.value_multi" = "p.value")
+
+uni_treat_df %>% left_join(multi_treat_df, by=c('term'))
+
+# model_denom %>% tbl_regression(exponentiate = TRUE, tidy_fun = my_negbin_tidy) %>% as_gt() %>% gt::tab_header(title = "Multivariable")
+```
+
+
+```{r}
+# spline terms
+s_terms = c("monocytes",
+            "news_score")
+
+s_terms_splined = paste0("ns(", s_terms)
+s_terms_splined = paste0(s_terms_splined, ", knots = var_quants$")
+s_terms_splined = paste0(s_terms_splined, s_terms, sep='')
+s_terms_splined = paste0(s_terms_splined, ")")
+
+# loop through other terms to interact with time
+for(i in seq_along(s_terms)){
+  var = s_terms[i]
+  
+  uv_form = paste("treat_up ~", s_terms_splined[i])
+  uv_1 = glm("treat_up ~ 1", data=new.treat.df, family=binomial(link='logit'))
+  uv_2 = glm(uv_form, data=new.treat.df, family=binomial(link='logit'))
+  
+  uv_result = lrtest(uv_1, uv_2)[2,5][[1]]
+  print(paste("univar spline LL test for", var, "is:", as.character(uv_result)))
+  
+}
+
+news_s = update(model_denom, .~. -ns(news_score, knots = var_quants$news_score) + news_score)
+lrtest(model_denom, news_s)[2,5][[1]]
+
+mono_s = update(model_denom, .~. -ns(monocytes, knots = var_quants$monocytes) + monocytes)
+lrtest(model_denom, mono_s)[2,5][[1]]
+
+model_denom
+
+# for time
+uv_form = paste("treat_up ~ ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))")
+uv_1 = glm("treat_up ~ 1", data=new.treat.df, family=binomial(link='logit'))
+uv_2 = glm(uv_form, data=new.treat.df, family=binomial(link='logit'))
+uv_result = lrtest(uv_1, uv_2)[2,5][[1]]
+print(paste("univar spline LL test for time is:", as.character(uv_result)))
+without_time = update(model_denom, .~. -ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10)))
+mv_result = lrtest(without_time, model_denom)[2, 5][[1]]
+print(paste("multivar spline LL test for time is:", as.character(result)))
+```
+
+
+
+#### Interactions between variables and time
+
+```{r}
+final.denom.model.vars = c("AgeAtAdmission", "BMI", "immunosuppression", 
+                           "PriorHospitalisation", "Specialty", "palliative_care_any",
+                           "firstline_resist", "urine_firstline_resist", 
+                           "worsening_news_class", "AVPU", "OxygenSaturation",
+                           "SupplementaryOxygen", "albumin", "urea", "neutrophils",
+                           "alkaline_phosphatase", 
+                           "ns(monocytes, knots = var_quants$monocytes)",
+                           "ns(news_score, knots = var_quants$news_score)", 
+                           "crp", 
+                           "last24h_crp_post24_3L")
+
+final.denom.model = model_denom
+
+# loop through other terms to interact with time
+for(i in seq_along(final.denom.model.vars)){
+  var = final.denom.model.vars[i]
+  
+  new.form = as.formula(paste0('treat_up ~ ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10)) + AgeAtAdmission + BMI + immunosuppression + PriorHospitalisation + Specialty + palliative_care_any + firstline_resist + urine_firstline_resist + worsening_news_class + AVPU + OxygenSaturation + SupplementaryOxygen + albumin + urea + neutrophils + alkaline_phosphatase + ns(monocytes, knots = var_quants$monocytes) + ns(news_score, knots = var_quants$news_score) + crp + last24h_crp_post24_3L + ', paste0(var, "*ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))")))
+
+  old = glm(final.denom.model, data = new.treat.df, family = binomial(link = "logit"))
+  new = glm(new.form, data = new.treat.df, family = binomial(link = 'logit'))
+
+  result = lrtest(old, new)[2, 5][[1]]
+  
+  print(paste("interaction LL test for", var, "is:", as.character(result)))
+  
+  # multiple testing correction
+  p.corrected = p.adjust(result, method = "hochberg", n = length(final.denom.model.vars))
+  
+  print(paste("\ncorrected p-value", as.character(p.corrected)))
+}
+
+```
+
+
+
+
+
+
+
+
+
+###d. IPTW + adjustment for orig. baseline + new vars in outcome model
+
+```{r}
+options(warn=-1) # Suppress warning messages
+adj.new.wt.fit <- glm(formula = death==1 ~ treat_up + ns(time, knots = c(2, 4, 6, 8, 12), Boundary.knots = c(1, 16))
+                + AgeAtAdmission + BMI + immunosuppression + PriorHospitalisation + Specialty 
+                + AVPU_base + OxygenSaturation_base + SupplementaryOxygen_base 
+                + albumin_base + alkaline_phosphatase_base + urea_base
+                + monocytes_base + immature_granulocytes_base
+                + I((neutrophils_base/10)^-0.5)
+                + palliative_care_any 
+                + firstline_resist 
+                + urine_firstline_resist 
+                + news_score_base 
+                + crp_base 
+                ,
+                
+                 family = binomial(link = 'logit'),
+                 data = outcome_df,
+              weights = ipw_manual)
+
+# Print results 
+summary(adj.new.wt.fit)
+
+exp(cbind(OR = coef(adj.new.wt.fit), confint(adj.new.wt.fit)))
+
+robust_se(adj.new.wt.fit)
+options(warn=-0) 
+```
+
+
+```{r}
+options(warn=-1) # Suppress warning messages
+adj.orig.wt.fit <- glm(formula = death==1 ~ treat_up + ns(time, knots = c(2, 4, 6, 8, 12), Boundary.knots = c(1, 16))
+                + AgeAtAdmission + BMI + immunosuppression + PriorHospitalisation + Specialty 
+                + AVPU_base + OxygenSaturation_base + SupplementaryOxygen_base 
+                + albumin_base + alkaline_phosphatase_base + urea_base
+                + monocytes_base + immature_granulocytes_base
+                + I((neutrophils_base/10)^-0.5)
+                ,
+                
+                 family = binomial(link = 'logit'),
+                 data = outcome_df,
+              weights = ipw_manual)
+
+# Print results 
+summary(adj.orig.wt.fit)
+
+exp(cbind(OR = coef(adj.orig.wt.fit), confint(adj.orig.wt.fit)))
+
+robust_se(adj.orig.wt.fit)
+options(warn=-0) 
+```
+
+
+######Outcome model univariable and multivariable coefficients
+
+*without IPTW*
+```{r}
+explanatory_vars = names(model.frame(extra.adj.no.wt.new))[c(2:22)]
+time_var = names(model.frame(extra.adj.no.wt.new))[3]
+
+# compute estimates for each confounder variable
+univ_models = explanatory_vars %>%       # begin with variables of interest
+  str_c(paste0("death==1 ~ ", time_var, " + "), .) %>%
+  
+  map(                               
+    .f = ~glm(                       # pass the formulas one-by-one to glm()
+      formula = as.formula(.x),      # within glm(), the string formula is .x
+      family = binomial(link = 'logit'),           # specify type of glm (logistic)
+      data = outcome_df)
+      %>% robust_se(.) %>%
+      select(term, OR, ll, ul, everything()) %>%
+      filter(!grepl("time",term)) %>%
+      filter(!grepl("Intercept",term)) %>%
+      select(term, OR, ll, ul, p.value) %>%
+      mutate(across(.cols = c(OR, ll, ul, p.value), ~ round_half_up(.x, digits=3)))
+    )
+
+uni_outcome_df = bind_rows(univ_models) %>%
+  mutate(CI_95 = str_c(ll, ', ', ul)) %>%
+  select(term, OR, CI_95, p.value)
+
+multi_outcome_df = extra.adj.no.wt.new %>%
+  # lmtest with robust s.e. and Wald p as default
+  robust_se(.) %>%
+  select(term, OR, ll, ul, everything()) %>%
+  filter(!grepl("time",term)) %>%
+  filter(!grepl("Intercept",term)) %>%
+  select(term, OR, ll, ul, p.value) %>%
+  mutate(across(.cols = c(OR, ll, ul, p.value), ~ round_half_up(.x, digits=3))) %>%
+  mutate(CI_95 = str_c(ll, ', ', ul)) %>%
+  select(term, OR, CI_95, p.value) %>%
+  rename("OR_multi" = "OR", "CI_95_multi" = "CI_95", "p.value_multi" = "p.value")
+
+merge(uni_outcome_df, multi_outcome_df)
+
+```
+
+```{r}
+# Wald p for time
+
+# univariable
+just_time = as.formula(paste0("death == 1 ~ ns(time, knots = c(2, 4, 6, 8, 12), Boundary.knots = c(1, 16))"))
+just_time_fit = glm(just_time, family = binomial(link='logit'),
+                    data = outcome_df)
+
+lrtest(just_time_fit, glm(formula = as.formula("death == 1 ~ 1"),
+                          family = binomial(link='logit'),
+                          data = outcome_df))
+
+# multivariable
+without_time = update(extra.adj.no.wt.new, .~. -ns(time, knots = c(2, 4, 6, 8, 12), Boundary.knots = c(1, 16)))
+
+lrtest(extra.adj.no.wt.new, without_time)
+```
+
+
+*WITH IPTW*
+
+```{r}
+explanatory_vars = names(model.frame(adj.new.wt.fit))[c(2:22)]
+time_var = names(model.frame(adj.new.wt.fit))[3]
+
+# compute estimates for each confounder variable
+univ_models = explanatory_vars %>%       # begin with variables of interest
+  str_c(paste0("death==1 ~ ", time_var, " + "), .) %>%
+  
+  map(                               
+    .f = ~glm(                       # pass the formulas one-by-one to glm()
+      formula = as.formula(.x),      # within glm(), the string formula is .x
+      family = binomial(link = 'logit'),           # specify type of glm (logistic)
+      data = outcome_df,
+      weights = ipw_manual)
+      %>% robust_se(.) %>%
+      select(term, OR, ll, ul, everything()) %>%
+      filter(!grepl("time",term)) %>%
+      filter(!grepl("Intercept",term)) %>%
+      select(term, OR, ll, ul, p.value) %>%
+      mutate(across(.cols = c(OR, ll, ul, p.value), ~ round_half_up(.x, digits=3)))
+    )
+
+uni_outcome_df = bind_rows(univ_models) %>%
+  mutate(CI_95 = str_c(ll, ', ', ul)) %>%
+  select(term, OR, CI_95, p.value)
+
+multi_outcome_df = adj.new.wt.fit %>%
+  # lmtest with robust s.e. and Wald p as default
+  robust_se(.) %>%
+  select(term, OR, ll, ul, everything()) %>%
+  filter(!grepl("time",term)) %>%
+  filter(!grepl("Intercept",term)) %>%
+  select(term, OR, ll, ul, p.value) %>%
+  mutate(across(.cols = c(OR, ll, ul, p.value), ~ round_half_up(.x, digits=3))) %>%
+  mutate(CI_95 = str_c(ll, ', ', ul)) %>%
+  select(term, OR, CI_95, p.value) %>%
+  rename("OR_multi" = "OR", "CI_95_multi" = "CI_95", "p.value_multi" = "p.value")
+
+merge(uni_outcome_df, multi_outcome_df)
+```
+
+```{r}
+# Wald p for time
+
+# univariable
+just_time = as.formula(paste0("death == 1 ~ ns(time, knots = c(2, 4, 6, 8, 12), Boundary.knots = c(1, 16))"))
+just_time_fit = glm(just_time, family = binomial(link='logit'),
+                    data = outcome_df, 
+                    weights = ipw_manual)
+
+lrtest(just_time_fit, glm(formula = as.formula("death == 1 ~ 1"),
+                          family = binomial(link='logit'),
+                          data = outcome_df,
+                          weights = ipw_manual))
+
+# multivariable
+without_time = update(adj.new.wt.fit, .~. -ns(time, knots = c(2, 4, 6, 8, 12), Boundary.knots = c(1, 16)))
+
+lrtest(adj.new.wt.fit, without_time)
+```
+
+
+####Final treatment model with interactions
+```{r}
+
+full.interac.form = update(final.denom.model$formula, .~.
+                           + PriorHospitalisation * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))
+                           + palliative_care_any * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))
+                           + Specialty * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))
+                           + firstline_resist * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))
+                           + urine_firstline_resist  * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))
+                           + AVPU * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))
+                           + albumin * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))
+                           + ns(monocytes, knots = var_quants$monocytes) * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))
+                           + ns(news_score, knots = var_quants$news_score) * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))
+                           + last24h_crp_post24_3L * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10)))
+
+full.interac.num <- glm(model_num$formula, 
+                        data = new.treat.df, 
+                        family = binomial(link = "logit"))
+
+full.interact.denom <- glm(full.interac.form,
+                           data = new.treat.df, 
+                           family = binomial(link = "logit"))
+
+# compute IPTW
+iptw_manual <- compute_iptw(new.treat.df, full.interac.num, full.interact.denom) %>%
+  mutate(base_treatment = case_when(treat_base == 1 ~ 'active',
+                                    treat_base == 0 ~ 'inactive'),
+         base_treatment = factor(base_treatment, levels = c('active', 'inactive')))
+
+iptw_manual %>% select(ipw_manual) %>% summary(.)
+paste0("sd: ", sd(iptw_manual$ipw_manual))
+
+# plot IPWs by time point
+iptw_means = compute_iptw_means(iptw_manual)
+
+p = plot_iptws(iptw_manual, iptw_means) +
+  scale_y_continuous(breaks = c(0, 1, 2, 3, 4, 5), limits = c(0, 5.5) ) +
+  labs(x='time intervals', y='IPTW') +
+  theme_minimal()
+
+# plot IPWs by antibiotic activity
+p2 = ggplot(subset(iptw_manual, base_treatment == 'active'), 
+                       aes(x = propensity_denom, fill = base_treatment)) +
+                       geom_histogram(aes(y = ..density..), binwidth=0.01, show.legend=FALSE) + 
+                       geom_histogram(data = subset(iptw_manual, base_treatment == 'inactive'),
+                       aes(x = propensity_denom, y = - ..density.., fill = base_treatment), binwidth=0.01, show.legend=FALSE) + 
+                       ylab("Density (%)") + 
+                       xlab("probability of receiving active treatment") + 
+                       scale_fill_discrete(name = "Baseline antibiotic activity") +
+  scale_y_continuous(limits = c(-6, 8), breaks = seq(-6, 8, 2)) +
+  theme_minimal()
+
+p3 = ggplot(subset(iptw_manual, base_treatment == 'active'), 
+                       aes(x = ipw_manual, fill = base_treatment)) +
+                       geom_histogram(aes(y = ..density..), binwidth=0.01) + 
+                       geom_histogram(data = subset(iptw_manual, base_treatment == 'inactive'),
+                       aes(x = ipw_manual, y = - ..density.., fill = base_treatment), binwidth=0.01) + 
+                       ylab("Density (%)") + 
+                       xlab("IPTW") +  
+                       scale_fill_discrete(name = "Baseline antibiotic activity") +
+  # scale_y_continuous(limits = c(-6, 11), breaks = seq(-6, 10, 2)) +
+  theme_minimal()
+
+mean(iptw_manual$ipw_manual)
+sd(iptw_manual$ipw_manual)
+
+(p2 | p3) / p +
+  plot_annotation(tag_levels = 'A')
+```
+
+```{r}
+end_tstart = 10
+
+# add weights to person-time data
+iptw_link = iptw_manual %>%
+  # only cases to time <=10 due to data sparsity beyond
+  filter(tstart <= end_tstart) %>%
+  dplyr::select(id, time, ipw_manual) 
+
+treat_elig <- outcome.model.df %>%
+  left_join(iptw_link, by=c('id', 'time')) %>%
+  group_by(id) %>%
+  arrange(id, time) %>%
+  fill(ipw_manual, .direction = 'down') %>% ungroup()
+
+# truncate stabilized weights
+threshold_99 <- quantile(treat_elig$ipw_manual, 0.99)
+threshold_1 <- quantile(treat_elig$ipw_manual, 0.01)
+treat_elig$sw_1_99 <- treat_elig$ipw_manual
+treat_elig = treat_elig %>% mutate(sw_1_99 = case_when(sw_1_99 > threshold_99 ~ threshold_99,
+                                                       sw_1_99 < threshold_1 ~ threshold_1,
+                                                       TRUE ~ sw_1_99))
+
+sd(treat_elig$ipw_manual)
+summary(treat_elig$ipw_manual)
+summary(treat_elig$sw_1_99)
+```
+
+```{r}
+# ELIGIBLE cases i.e., post time=0 because in outcome model, nobody dies at time=0
+outcome_df = treat_elig %>% filter(time != 0)
+outcome_df = data.frame(outcome_df)
+
+# code to generate splines for continuous variables
+other_cont = c('AgeAtAdmission', 'BMI', 'news_score', 'news_score_base')
+cont_vars = c(labs_var, obs_var[obs_var %notin% c('AVPU', 'SupplementaryOxygen')],
+              labs_var_base, obs_var_base[obs_var_base %notin% c('AVPU_base', 'SupplementaryOxygen_base')], other_cont)
+
+var_quants = list()
+for (i in seq_along(cont_vars)){
+  var = cont_vars[[i]]
+  var_str = as.character(var)
+
+  qs = unname(quantile(outcome_df[[var]], probs = c(0.1, 0.5, 0.9)))
+  
+  var_quants[[var_str]] <- qs
+  
+}
+```
+
+```{r}
+options(warn=-1) # Suppress warning messages
+unadj.new.interac.wt.fit <- glm(formula = death==1 ~ treat_up + ns(time, knots = c(2, 4, 6, 8, 12), Boundary.knots = c(1, 16)),
+                              family = binomial(link = 'logit'),
+                              data = outcome_df,
+                              weights = ipw_manual)
+
+# Print results 
+summary(unadj.new.interac.wt.fit)
+
+exp(cbind(OR = coef(unadj.new.interac.wt.fit), confint(unadj.new.interac.wt.fit)))
+
+robust_se(unadj.new.interac.wt.fit)
+options(warn=-0) 
+```
+
+```{r}
+options(warn=-1) # Suppress warning messages
+adj.new.interac.wt.fit <- glm(formula = death==1 ~ treat_up + ns(time, knots = c(2, 4, 6, 8, 12), Boundary.knots = c(1, 16))
+                + AgeAtAdmission + BMI + immunosuppression + PriorHospitalisation + Specialty 
+                + AVPU_base + OxygenSaturation_base + SupplementaryOxygen_base 
+                + albumin_base + alkaline_phosphatase_base + urea_base
+                + monocytes_base + immature_granulocytes_base
+                + I((neutrophils_base/10)^-0.5)
+                + palliative_care_any 
+                + firstline_resist 
+                + urine_firstline_resist 
+                + news_score_base 
+                + crp_base
+                ,
+                
+                 family = binomial(link = 'logit'),
+                 data = outcome_df,
+              weights = ipw_manual)
+
+# Print results 
+summary(adj.new.interac.wt.fit)
+
+exp(cbind(OR = coef(adj.new.interac.wt.fit), confint(adj.new.interac.wt.fit)))
+
+robust_se(adj.new.interac.wt.fit)
+options(warn=-0) 
+```
+
+
+
+
+

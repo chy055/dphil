@@ -1,0 +1,1263 @@
+---
+title: "multi_arm_msm"
+author: "Chang Ho Yoon"
+date: "12/01/2024"
+output: html_document
+---
+
+This markdown details the treatment weight model decisions for emulation of
+the multi-arm target trial. As detailed below, the same script may be used
+for a high-resistance breakpoint definition for amoxicillin-clavulanate in
+E. coli bacteraemia, and also for Enterobacterales bacteraemia by switching
+the loaded dataframe or not filtering to E. coli (from the loaded Enterobacterales
+dataframe). Some of the code here has been inspired by various papers by
+Hernán, Robins et al. 
+
+
+```{r setup, include=FALSE}
+# load dependencies
+if (!require("pacman")) install.packages("pacman")
+library(pacman)
+
+pacman::p_load(
+  tidyverse,    # data management + ggplot2 graphics
+  ggthemes,     # expansion pack for ggplot2
+  cowplot,      # another expansion pack for ggplot2
+  patchwork,    # facet grid
+  scales,       # scale functions for ggplot2 visualisation
+  stringr,      # manipulate text strings 
+  purrr,        # loop over objects in a tidy way
+  glue,         # R's version of f-strings
+  lubridate,    # time / date objects
+  assertr,      # assert functions
+  gtsummary,    # publication-qual. tables 
+  
+  # survival and other regression analyses
+  lmtest,       # likelihood-ratio tests
+  effectsize,   # utilities to work with indices of effect sizes for variety of models
+  survival,     # classic survival analysis package, KM, Cox, etc.
+  survminer,    # to draw survival graphs (publication-ready)
+  boot,         # bootstrapping functions
+  splines,      # fitting splines
+  AICcmodavg,    # calculating AIC/AICc for model selection etc.
+  survey,       # weighted analyses
+  sandwich,     # sandwich estimator
+  
+  # specific causal inference packages
+  ipw,          # IPW calculating package ### NO LONGER MAINTAINED FROM 2021 ###
+  WeightIt     # another IPW-calculating package
+  )
+
+# create additional custom commands
+`%notin%` <- Negate(`%in%`)
+`%notwithin%` <- Negate(`%within%`)
+`%+%` <- ggplot2::`%+%`
+
+# import functions
+source("utils/CAUSAL_utils.R")
+```
+
+# import data
+```{r}
+# enterobacterales data
+entero_df = read_csv('#####/#####.csv', 
+                     guess_max = 1e6, 
+                     show_col_types = FALSE) 
+
+# [OPTIONAL] filter for ecoli_cases
+ecoli_df = entero_df %>% filter(`E. coli` == 1)
+ecoli_df$id <- 1:nrow(ecoli_df)
+
+ecoli_cases <- ecoli_df %>%
+  select(id, ClusterID, SpellID, NewCulturePeriodNumber, ActiveBaseline) %>%
+  distinct() 
+
+# outcomes df
+outcomes_df = entero_df %>%
+  select(ClusterID, SpellID, CensorStatus_day14, OS_14, Followup_outcome_day14, 
+         in_hospital_death_day14, out_of_hospital_death_day14)
+
+deaths = ecoli_cases %>% select(id, ClusterID, SpellID) %>%
+  left_join(outcomes_df, by=c('ClusterID', 'SpellID')) %>% 
+  select(id, LinkedDeathdateAdjusted, LinkedDeathdate_v_adm) %>% distinct()
+```
+
+
+#Load analysis data frames
+*set variables*
+```{r}
+labs_var = c('crp', 'albumin', 'alkaline_phosphatase',
+             'urea', 'monocytes', 'neutrophils', 'immature_granulocytes')
+labs_var_base = paste0(labs_var, '_base')
+obs_var = c('AVPU', 'SupplementaryOxygen', 'OxygenSaturation',
+            'HeartRate', 'SBP', 'RespiratoryRate', 'Temperature')
+obs_var_base = paste0(obs_var, '_base')
+```
+
+*make outcome model df*
+```{r}
+# set variables
+labs_var = c('crp', 'albumin', 'alkaline_phosphatase', 'urea', 'monocytes', 'neutrophils', 'immature_granulocytes')
+labs_var_base = paste0(labs_var, '_base')
+
+obs_var = c('AVPU', 'SupplementaryOxygen', 'OxygenSaturation',
+            # following obs not in original Cox model
+            'HeartRate', 'SBP', 'RespiratoryRate', 'Temperature')
+obs_var_base = paste0(obs_var, '_base')
+
+###### EDIT according to user's own location of data ######
+# should be truncated already (as per methods)
+df_full <- read_csv('#####/#####.csv', guess_max=1e6,
+                        show_col_types = FALSE)
+
+# complete cases
+df_baseline = df_full %>% filter(time==0)
+df_base_comp = df_baseline[complete.cases(df_baseline),]
+# ids of complete cases
+comp_ids = df_base_comp %>% distinct(id) %>% .$id
+df_complete = df_full %>% filter(id %in% comp_ids)
+
+# identify cases receiving active treatment at baseline vs. not
+ec.never.id = df_complete %>% group_by(id) %>% filter(all(treat_up == 0)) %>% ungroup() %>% distinct(id) %>% .$id
+ec.inactive.base.id = df_complete %>% group_by(id) %>% filter(!any(treat_up == 1 & time == 0)) %>% ungroup() %>% distinct(id) %>% .$id
+ec.post.active.id = df_complete %>% group_by(id) %>% filter(any(treat_up == 1 & time > 0) & !any(treat_up == 1 & time == 0)) %>% ungroup() %>% distinct(id) %>% .$id
+ec.active.base.id = df_complete %>% group_by(id) %>% filter(any(treat_up == 1 & time == 0)) %>% ungroup() %>% distinct(id) %>% .$id
+
+length(ec.never.id) + length(ec.post.active.id) + length(ec.active.base.id) == length(comp_ids)
+
+# scale variables for improved interpretability
+outcome.model.df <- df_complete %>%
+  mutate(AgeAtAdmission = AgeAtAdmission / 10,
+         BMI = BMI / 10,
+         alkaline_phosphatase = (alkaline_phosphatase + 1e-10) / 100,
+         alkaline_phosphatase_base = (alkaline_phosphatase_base + 1e-10) / 100,
+         crp = (crp + 1e-10) / 10,
+         crp_base = (crp_base + 1e-10) / 10) 
+
+head(outcome.model.df, 3)
+```
+
+*Define IDs where active baseline, never active, post-baseline active*
+```{r}
+total_ec = outcome.model.df %>% distinct(id) %>% .$id
+
+new_ec_active = outcome.model.df %>%
+  filter(time==0 & treat_up==1) %>% distinct(id) %>% .$id
+
+new_ec_never_active = outcome.model.df %>%
+  group_by(id) %>% mutate(keep = case_when(all(treat_up == 0) ~ 1, 
+                                           TRUE ~ 0)) %>% 
+  ungroup() %>%
+  filter(keep == 1) %>% distinct(id) %>% .$id
+
+new_ec_post_active = outcome.model.df %>%
+  group_by(id) %>% mutate(keep = case_when(any(treat_up == 1 & time>0) & (treat_up ==0 & time==0) ~ 1, 
+                                           TRUE ~ 0)) %>% 
+  ungroup() %>%
+  filter(keep == 1) %>% distinct(id) %>% .$id
+
+length(new_ec_post_active) + length(new_ec_never_active) + length(new_ec_active) == length(total_ec)
+```
+
+*see distributions of outcome*
+based on discharge/episode end dates
+```{r}
+df_complete %>% filter(death == 1) %>%
+  group_by(time) %>% summarise(sum = sum(death)) %>%
+  ggplot(aes(x=time, y=sum)) + geom_bar(stat = 'identity', fill='steelblue') + labs(x = 'time periods', y='total deaths', title = 'deaths by time [disch dates]') + 
+  theme(panel.background = element_blank(), panel.grid.major = element_line(colour = "grey95"))
+```
+
+
+*check distributions of deaths across time between the two arms*
+```{r}
+df_complete %>% filter(death == 1) %>%
+  group_by(time, treat_base) %>% summarise(sum = sum(death)) %>%
+  mutate(active_baseline = case_when(treat_base == 1 ~ 1, TRUE ~ 0)) %>%
+  mutate(active_baseline = factor(active_baseline, levels = c(1, 0 ))) %>%
+  ggplot(aes(x=time, y=sum, fill=active_baseline)) + 
+  geom_bar(stat = 'identity', position = 'stack') + 
+  labs(x = 'time periods', y='total deaths', title = 'deaths by time and baseline treatment group [disch dates]') + 
+  theme(panel.background = element_blank(), panel.grid.major = element_line(colour = "grey95"))
+
+```
+
+*unadjusted KM time to death by baseline activity*
+```{r}
+km_df = outcome.model.df %>%
+  left_join(ecoli_cont_outcomes, by='id') %>% distinct() %>%
+  group_by(id) %>% slice(1) %>%
+  mutate(active_baseline = case_when(treat_base == 1 ~ 1, TRUE ~ 0)) %>%
+  mutate(active_baseline = factor(active_baseline, levels = c(1, 0 ))) 
+
+fit <- survfit(Surv(OS_14, CensorStatus_day14) ~ active_baseline, data = km_df)
+
+# plot using custom x-axis time intervals
+km_plot <- ggsurvplot(fit, data = km_df, 
+           risk.table=TRUE, fontsize =1,
+           ylim=c(0.85, 1),
+           xlab = "Time intervals",
+           break.x.by = 0.25,
+           pval = TRUE, pval.coord = c(13, 0.95), pval.size = 3.5, conf.int = FALSE,
+           legend.labs = c("Active", "Inactive"),
+           legend.title="Baseline antibiotic activity:")
+
+# extract table object from ggsurvplot
+tab <- km_plot$table
+tab$layers = NULL # clear labels
+tab <- tab + 
+  geom_text(aes(x = time, y = rev(strata), label = llabels), data = tab$data[tab$data$time %in% c(0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 3, 4, 5, 6,7,8,9,10,11,12,13, 14),], size=2) +
+  scale_x_continuous(limits = c(0.5, 14), breaks = c(0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 3, 4, 5, 6,7,8,9,10,11,12,13, 14),
+                     labels = c('0','1','2','3','4','5','6','7','8','9','10','11','12','13','14','15','16','17','18','19')) +
+  labs(y = '')
+
+km_ggplot <- km_plot$plot +
+  scale_x_continuous(limits = c(0.5, 14), breaks = c(0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.25, 3, 4, 5, 6,7,8,9,10,11,12,13, 14),
+                     labels = c('0','1','2','3','4','5','6','7','8','9','10','11','12','13','14','15','16','17','18','19'))
+
+km_plot$plot <- km_ggplot
+km_plot$table <- tab
+
+km_plot
+```
+
+
+
+#1. clone
+- delay treatment arms 
+- arm0 = delay by 0 time intervals
+- arm1 = delay by 1 time interval
+- arm2 = delay by 2 time intervals
+- arm3 = delay by 3 time intervals
+- ...
+- arm10 = delay by >=10 time intervals
+
+
+```{r}
+# convert tibbles to data table
+ec_active_base_df = outcome.model.df %>% filter(id %in% new_ec_active)
+ec_inactive_base_df = outcome.model.df %>% filter(id %notin% new_ec_active)
+
+ec_active_base_df = as.data.table(ec_active_base_df, keep.rownames = FALSE)
+ec_inactive_base_df = as.data.table(ec_inactive_base_df, keep.rownames = FALSE)
+
+# clone for different strategies
+arm0 <- copy(ec_active_base_df)[,arm:=0]
+setcolorder(arm0, c('id', 'arm'))
+
+make_arm <- function(df, arm_n){
+  
+  arm <- copy(df)[,arm:=arm_n]
+  setcolorder(arm, c('id', 'arm'))
+  
+}
+
+list_of_arms = list()
+n_arms = 10
+for(i in seq_along(1:n_arms)){
+  
+  output_arm = make_arm(ec_inactive_base_df, arm_n = i)
+  
+  list_of_arms[[i]] <- output_arm
+  
+}
+
+arm1 = list_of_arms[[1]]
+arm2 = list_of_arms[[2]]
+arm3 = list_of_arms[[3]]
+arm4 = list_of_arms[[4]]
+arm5 = list_of_arms[[5]]
+arm6 = list_of_arms[[6]]
+arm7 = list_of_arms[[7]]
+arm8 = list_of_arms[[8]]
+arm9 = list_of_arms[[9]]
+arm10 = list_of_arms[[10]]
+
+head(arm10,3)
+```
+
+
+#2. censor
+```{r}
+### Censor clones in arm 1 when non-adherent ###
+
+# Create a function to define censoring protocol for those assigned to 1-interval delay strategy
+arm1.censor <- function(treat_up){
+  n <- length(treat_up)
+  my.censor <- rep(0,n)
+  first.cens <- NA
+  
+  if ( n> 1 & treat_up[2] == 0) {
+    first.cens = 2
+  } 
+
+  if ( !(is.na(first.cens) )) {
+    my.censor[first.cens:n] <- rep(1,(n-first.cens+1))
+  }   
+  
+  return(my.censor)
+}
+
+# Censor clones
+arm1.c <- copy(arm1)[,my.censor := arm1.censor(treat_up),by=id][,good := cumsum(my.censor),by=id][good <= 1][,good:=NULL]
+
+# "Censor" check
+arm1.c %>%
+  group_by(id) %>%
+  filter(n()>2) %>% ungroup() %>% distinct(id)
+
+arm1.c %>%
+  group_by(id) %>%
+  mutate(total_n = n()) %>%
+  ungroup() %>%
+  distinct(id, .keep_all = T) %>%
+  count(total_n)
+
+arm1.c
+```
+
+```{r}
+### Censor clones in arm 2 when non-adherent ###
+
+# Create a function to define censoring protocol for 2-interval delay
+arm2.censor <- function(treat_up){
+  n <- length(treat_up)
+  my.censor <- rep(0,n)
+  first.cens <- NA
+  
+  if (n > 1 & treat_up[2] == 1) {
+    first.cens = 2
+  } else if (n > 2 & treat_up[3] == 0) {
+    first.cens = 3
+  } 
+
+  if ( !(is.na(first.cens) )) {
+    my.censor[first.cens:n] <- rep(1,(n-first.cens+1))
+  }   
+  
+  return(my.censor)
+}
+
+# Censor clones
+arm2.c <- copy(arm2)[,my.censor :=arm2.censor(treat_up),by=id][,good:=cumsum(my.censor),by=id][good <= 1][,good:=NULL]
+
+# "Censor" check
+arm2.c %>%
+  group_by(id) %>%
+  filter(n()>3) %>% ungroup() %>% distinct(id)
+
+arm2.c %>%
+  group_by(id) %>%
+  mutate(total_n = n()) %>%
+  ungroup() %>%
+  distinct(id, .keep_all = T) %>%
+  count(total_n)
+
+arm2.c
+```
+
+```{r}
+### Censor clones in arm 3 when non-adherent ###
+
+# Create a function to define censoring protocol for 3-interval delay
+arm3.censor <- function(treat_up){
+  n <- length(treat_up)
+  my.censor <- rep(0,n)
+  first.cens <- NA
+  
+  if (n > 1 & treat_up[2] == 1) {
+    first.cens = 2
+  } else if (n > 2 & treat_up[3] == 1) {
+    first.cens = 3
+  } else if (n > 3 & treat_up[4] == 0) {
+    first.cens = 4
+  } 
+
+  if ( !(is.na(first.cens) )) {
+    my.censor[first.cens:n] <- rep(1,(n-first.cens+1))
+  }   
+  
+  return(my.censor)
+}
+
+# Censor clones
+arm3.c <- copy(arm3)[,my.censor :=arm3.censor(treat_up),by=id][,good:=cumsum(my.censor),by=id][good <= 1][,good:=NULL]
+
+# "Censor" check
+arm3.c %>%
+  group_by(id) %>%
+  filter(n()>4) %>% ungroup() %>% distinct(id)
+
+arm3.c %>%
+  group_by(id) %>%
+  mutate(total_n = n()) %>%
+  ungroup() %>%
+  distinct(id, .keep_all = T) %>%
+  count(total_n)
+
+arm3.c
+```
+
+
+```{r}
+### Censor clones in arm 4 when non-adherent ###
+
+# Create a function to define censoring protocol for 4-interval delay
+arm4.censor <- function(treat_up){
+  n <- length(treat_up)
+  my.censor <- rep(0,n)
+  first.cens <- NA
+  
+  if (n > 1 & treat_up[2] == 1) {
+    first.cens = 2
+  } else if (n > 2 & treat_up[3] == 1) {
+    first.cens = 3
+  } else if (n > 3 & treat_up[4] == 1) {
+    first.cens = 4
+  } else if (n > 4 & treat_up[5] == 0) {
+    first.cens = 5
+  } 
+
+  if ( !(is.na(first.cens) )) {
+    my.censor[first.cens:n] <- rep(1,(n-first.cens+1))
+  }   
+  
+  return(my.censor)
+}
+
+# Censor clones
+arm4.c <- copy(arm4)[,my.censor :=arm4.censor(treat_up),by=id][,good:=cumsum(my.censor),by=id][good <= 1][,good:=NULL]
+
+# "Censor" check
+arm4.c %>%
+  group_by(id) %>%
+  filter(n()>5) %>% ungroup() %>% distinct(id)
+
+arm4.c %>%
+  group_by(id) %>%
+  mutate(total_n = n()) %>%
+  ungroup() %>%
+  distinct(id, .keep_all = T) %>%
+  count(total_n)
+```
+
+
+```{r}
+### Censor clones in arm 5 when non-adherent ###
+
+# Create a function to define censoring protocol for 5-interval delay
+arm5.censor <- function(treat_up){
+  n <- length(treat_up)
+  my.censor <- rep(0,n)
+  first.cens <- NA
+  
+  if (n > 1 & treat_up[2] == 1) {
+    first.cens = 2
+  } else if (n > 2 & treat_up[3] == 1) {
+    first.cens = 3
+  } else if (n > 3 & treat_up[4] == 1) {
+    first.cens = 4
+  } else if (n > 4 & treat_up[5] == 1) {
+    first.cens = 5
+  } else if (n > 5 & treat_up[6] == 0) {
+    first.cens = 6
+  } 
+
+  if ( !(is.na(first.cens) )) {
+    my.censor[first.cens:n] <- rep(1,(n-first.cens+1))
+  }   
+  
+  return(my.censor)
+}
+
+# Censor clones
+arm5.c <- copy(arm5)[,my.censor :=arm5.censor(treat_up),by=id][,good:=cumsum(my.censor),by=id][good <= 1][,good:=NULL]
+
+# "Censor" check
+arm5.c %>%
+  group_by(id) %>%
+  filter(n()>6) %>% ungroup() %>% distinct(id)
+
+arm5.c %>%
+  group_by(id) %>%
+  mutate(total_n = n()) %>%
+  ungroup() %>%
+  distinct(id, .keep_all = T) %>%
+  count(total_n)
+
+arm5.c
+```
+
+
+```{r}
+### Censor clones in arm 6 when non-adherent ###
+
+# Create a function to define censoring protocol for 6-interval delay
+arm6.censor <- function(treat_up){
+  n <- length(treat_up)
+  my.censor <- rep(0,n)
+  first.cens <- NA
+  
+  if (n > 1 & treat_up[2] == 1) {
+    first.cens = 2
+  } else if (n > 2 & treat_up[3] == 1) {
+    first.cens = 3
+  } else if (n > 3 & treat_up[4] == 1) {
+    first.cens = 4
+  } else if (n > 4 & treat_up[5] == 1) {
+    first.cens = 5
+  } else if ( n > 5 & treat_up[6] == 1) {
+    first.cens = 6
+  } else if (n > 6 & treat_up[7] == 0) {
+    first.cens = 7
+  } 
+
+  if ( !(is.na(first.cens) )) {
+    my.censor[first.cens:n] <- rep(1,(n-first.cens+1))
+  }   
+  
+  return(my.censor)
+}
+
+# Censor clones
+arm6.c <- copy(arm6)[,my.censor :=arm6.censor(treat_up),by=id][,good:=cumsum(my.censor),by=id][good <= 1][,good:=NULL]
+
+# "Censor" check
+arm6.c %>%
+  group_by(id) %>%
+  filter(n()>7) %>% ungroup() %>% distinct(id)
+
+arm6.c %>%
+  group_by(id) %>%
+  mutate(total_n = n()) %>%
+  ungroup() %>%
+  distinct(id, .keep_all = T) %>%
+  count(total_n)
+
+arm6.c
+```
+
+
+```{r}
+### Censor clones in arm 7 when non-adherent ###
+
+# Create a function to define censoring protocol for 7-interval delay
+arm7.censor <- function(treat_up){
+  n <- length(treat_up)
+  my.censor <- rep(0,n)
+  first.cens <- NA
+  
+  if (n > 1 & treat_up[2] == 1) {
+    first.cens = 2
+  } else if (n > 2 & treat_up[3] == 1) {
+    first.cens = 3
+  } else if (n > 3 & treat_up[4] == 1) {
+    first.cens = 4
+  } else if (n > 4 & treat_up[5] == 1) {
+    first.cens = 5
+  } else if ( n > 5 & treat_up[6] == 1) {
+    first.cens = 6
+  } else if ( n > 6 & treat_up[7] == 1) {
+    first.cens = 7
+  } else if (n > 7 & treat_up[8] == 0) {
+    first.cens = 8
+  } 
+
+  if ( !(is.na(first.cens) )) {
+    my.censor[first.cens:n] <- rep(1,(n-first.cens+1))
+  }   
+  
+  return(my.censor)
+}
+
+# Censor clones
+arm7.c <- copy(arm7)[,my.censor :=arm7.censor(treat_up),by=id][,good:=cumsum(my.censor),by=id][good <= 1][,good:=NULL]
+
+# "Censor" check
+arm7.c %>%
+  group_by(id) %>%
+  filter(n()>8) %>% ungroup() %>% distinct(id)
+
+arm7.c %>%
+  group_by(id) %>%
+  mutate(total_n = n()) %>%
+  ungroup() %>%
+  distinct(id, .keep_all = T) %>%
+  count(total_n)
+
+arm7.c %>%
+  select(id, time, death, treat_up, my.censor)
+```
+
+
+
+```{r}
+### Censor clones in arm 8 when non-adherent ###
+
+# Create a function to define censoring protocol for 8-interval delay
+arm8.censor <- function(treat_up){
+  n <- length(treat_up)
+  my.censor <- rep(0,n)
+  first.cens <- NA
+  
+  if (n > 1 & treat_up[2] == 1) {
+    first.cens = 2
+  } else if (n > 2 & treat_up[3] == 1) {
+    first.cens = 3
+  } else if (n > 3 & treat_up[4] == 1) {
+    first.cens = 4
+  } else if (n > 4 & treat_up[5] == 1) {
+    first.cens = 5
+  } else if ( n > 5 & treat_up[6] == 1) {
+    first.cens = 6
+  } else if ( n > 6 & treat_up[7] == 1) {
+    first.cens = 7
+  } else if ( n > 7 & treat_up[8] == 1) {
+    first.cens = 8
+  } else if (n > 8 & treat_up[9] == 0) {
+    first.cens = 9
+  } 
+
+  if ( !(is.na(first.cens) )) {
+    my.censor[first.cens:n] <- rep(1,(n-first.cens+1))
+  }   
+  
+  return(my.censor)
+}
+
+# Censor clones
+arm8.c <- copy(arm8)[,my.censor :=arm8.censor(treat_up),by=id][,good:=cumsum(my.censor),by=id][good <= 1][,good:=NULL]
+
+# "Censor" check
+arm8.c %>%
+  group_by(id) %>%
+  filter(n()>9) %>% ungroup() %>% distinct(id)
+
+arm8.c %>%
+  group_by(id) %>%
+  mutate(total_n = n()) %>%
+  ungroup() %>%
+  distinct(id, .keep_all = T) %>%
+  count(total_n)
+```
+
+
+```{r}
+### Censor clones in arm 9 when non-adherent ###
+
+# Create a function to define censoring protocol for 9-interval delay
+arm9.censor <- function(treat_up){
+  n <- length(treat_up)
+  my.censor <- rep(0,n)
+  first.cens <- NA
+  
+  if (n > 1 & treat_up[2] == 1) {
+    first.cens = 2
+  } else if (n > 2 & treat_up[3] == 1) {
+    first.cens = 3
+  } else if (n > 3 & treat_up[4] == 1) {
+    first.cens = 4
+  } else if (n > 4 & treat_up[5] == 1) {
+    first.cens = 5
+  } else if ( n > 5 & treat_up[6] == 1) {
+    first.cens = 6
+  } else if ( n > 6 & treat_up[7] == 1) {
+    first.cens = 7
+  } else if ( n > 7 & treat_up[8] == 1) {
+    first.cens = 8
+  } else if ( n > 8 & treat_up[9] == 1) {
+    first.cens = 9
+  } else if (n > 9 & treat_up[10] == 0) {
+    first.cens = 10
+  } 
+
+  if ( !(is.na(first.cens) )) {
+    my.censor[first.cens:n] <- rep(1,(n-first.cens+1))
+  }   
+  
+  return(my.censor)
+}
+
+# Censor clones
+arm9.c <- copy(arm9)[,my.censor :=arm9.censor(treat_up),by=id][,good:=cumsum(my.censor),by=id][good <= 1][,good:=NULL]
+
+# "Censor" check
+arm9.c %>%
+  group_by(id) %>%
+  filter(n()>10) %>% ungroup() %>% distinct(id)
+
+arm9.c %>%
+  group_by(id) %>%
+  mutate(total_n = n()) %>%
+  ungroup() %>%
+  distinct(id, .keep_all = T) %>%
+  count(total_n)
+```
+
+
+```{r}
+### Censor clones in arm 10 when non-adherent ###
+
+# Create a function to define censoring protocol for 10-interval delay
+arm10.censor <- function(treat_up){
+  n <- length(treat_up)
+  my.censor <- rep(0,n)
+  first.cens <- NA
+  
+  if (n > 1 & treat_up[2] == 1) {
+    first.cens = 2
+  } else if (n > 2 & treat_up[3] == 1) {
+    first.cens = 3
+  } else if (n > 3 & treat_up[4] == 1) {
+    first.cens = 4
+  } else if (n > 4 & treat_up[5] == 1) {
+    first.cens = 5
+  } else if ( n > 5 & treat_up[6] == 1) {
+    first.cens = 6
+  } else if ( n > 6 & treat_up[7] == 1) {
+    first.cens = 7
+  } else if ( n > 7 & treat_up[8] == 1) {
+    first.cens = 8
+  } else if ( n > 8 & treat_up[9] == 1) {
+    first.cens = 9
+  } else if ( n > 9 & treat_up[10] == 1) {
+    first.cens = 10
+  } else if (n > 10 & treat_up[11] == 0) {
+    first.cens = 11
+  } 
+
+  if ( !(is.na(first.cens) )) {
+    my.censor[first.cens:n] <- rep(1,(n-first.cens+1))
+  }   
+  
+  return(my.censor)
+}
+
+# Censor clones
+arm10.c <- copy(arm10)[,my.censor :=arm10.censor(treat_up),by=id][,good:=cumsum(my.censor),by=id][good <= 1][,good:=NULL]
+
+# "Censor" check
+arm10.c %>%
+  group_by(id) %>%
+  filter(n()>11) %>% ungroup() %>% distinct(id)
+
+arm10.c %>%
+  group_by(id) %>%
+  mutate(total_n = n()) %>%
+  ungroup() %>%
+  distinct(id, .keep_all = T) %>%
+  count(total_n)
+
+arm10.c
+```
+
+
+*COMBINE ALL CLONED DATAFRAMES*
+```{r}
+### COMBINE ALL 
+active_arm = make_arm(ec_active_base_df, arm_n = 0)
+active_arm = active_arm %>% mutate(my.censor = 0)
+
+# Assumed event order within each time interval: death, censor - one precludes the other
+all.arms = rbind(active_arm, arm1.c,arm2.c,arm3.c,arm4.c,arm5.c,arm6.c,arm7.c,arm8.c,arm9.c,arm10.c)[,death := ifelse(my.censor == 1 , NA,death)]
+
+# inspect example
+all.arms %>%
+  filter(time > 0) %>%
+  select(id, arm, time, death, treat_up, my.censor) %>%
+  filter(arm==2)
+
+# at time == 0 , no included cases should be censored
+all.arms %>% filter(time==0) %>% count(death, my.censor)
+
+
+```
+
+```{r}
+# sanity check cases 
+
+## 1: patient starting treatment at 10h has 10 clones
+###### - arm1 should have entire follow-up
+###### - arms 2-10 should have 1 period of observation
+
+outcome.model.df %>% filter(treat_up == 1) %>% group_by(id) %>% arrange(id, time) %>% slice(1) %>% ungroup() %>%
+  filter(time == 1)
+
+all.arms %>% filter(id == 121) %>% select(arm,  id, time, death, treat_up)
+
+## 2: patient starting treatment at 22h has 10 clones
+###### - arm3 should have entire follow-up
+###### - arm1 censored at time=1, arm2 censored at time=2, arms 4 onwards should be censored at time=3 (when up-treated)
+
+outcome.model.df %>% filter(treat_up == 1) %>% group_by(id) %>% arrange(id, time) %>% slice(1) %>% ungroup() %>%
+  filter(time == 3)
+
+all.arms %>% filter(id == 9) %>% select(arm, id, time, death, treat_up)
+```
+
+
+
+#3. IPTWs using the original 2-arm treatment model to predict artificial censoring in each arm
+Ultimately, the aim here is to re-weight at each time interval the patients who are compliant. 
+
+```{r}
+# treatment models fit on 2-arm treatment model: active at baseline vs. never active
+num_model.formula = as.formula(paste0("treat_up ~ ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10)) + AgeAtAdmission + BMI + immunosuppression + PriorHospitalisation + Specialty + palliative_care_any + firstline_resist + urine_firstline_resist + news_score_base + crp_base + albumin_base + urea_base + neutrophils_base + AVPU_base + OxygenSaturation_base + SupplementaryOxygen_base + alkaline_phosphatase_base + ns(monocytes_base, knots = var_quants$monocytes_base)"))
+
+denom_model.formula = as.formula(paste0("treat_up ~ ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10)) + AgeAtAdmission + BMI + immunosuppression + PriorHospitalisation + Specialty + palliative_care_any + firstline_resist + urine_firstline_resist + worsening_news_class + AVPU + OxygenSaturation + SupplementaryOxygen + albumin + urea + neutrophils + alkaline_phosphatase + ns(monocytes, knots = var_quants$monocytes) + ns(news_score, knots = var_quants$news_score) + crp + last24h_crp_post24_3L"))
+```
+
+*interaction model update*
+```{r}
+denom_model.formula = update(denom_model.formula, .~.
+                           + PriorHospitalisation * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))
+                           + palliative_care_any * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))
+                           + Specialty * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))
+                           + firstline_resist * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))
+                           + urine_firstline_resist  * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))
+                           + AVPU * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))
+                           + albumin * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))
+                           + ns(monocytes, knots = var_quants$monocytes) * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))
+                           + ns(news_score, knots = var_quants$news_score) * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10))
+                           + last24h_crp_post24_3L * ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10)))
+```
+
+
+
+```{r}
+# combined df for all arms up to point of switch
+treat.arm0 = outcome.model.df %>% filter(time==0) %>%
+  mutate(arm = 0)
+
+treat.all.arms = all.arms %>%
+  select(-my.censor) %>%
+  filter(arm != 0) %>%
+  rbind(treat.arm0) %>%
+  mutate(keep = case_when(arm == 0 & time == 0 ~ 1,
+                          arm == 1 & time <= 1 ~ 1,
+                          arm == 2 & time <=2 ~ 1,
+                          arm == 3 & time <=3 ~ 1,
+                          arm == 4 & time <=4 ~ 1,
+                          arm == 5 & time <=5 ~ 1,
+                          arm == 6 & time <=6 ~ 1,
+                          arm == 7 & time <=7 ~ 1,
+                          arm == 8 & time <=8 ~ 1,
+                          arm == 9 & time <=9 ~ 1,
+                          arm == 10 & time <=10 ~ 1)) %>%
+  filter(keep==1) %>% select(-keep)
+```
+
+
+## [a] Single treatment model for all arms
+Estimate probabilities of switching from inactive to active 
+- Assumes that the effect of covariates on switching to active is the same
+at all timepoints from antibiotic(s) initiation onwards
+
+
+```{r}
+# max follow-up time for post-baseline treatment escalation = when treatment escalation occurred
+
+switch_max_time = outcome.model.df %>%
+  filter(id %in% new_ec_post_active) %>%
+  filter(treat_up == 1) %>%
+  group_by(id) %>%
+  arrange(id, time) %>%
+  slice(1) %>%
+  mutate(max_tstop = tstop) %>%
+  dplyr::select(id, max_tstop)
+
+# in treatment model, keep:
+# 1) only 1st time row for active baseline
+# 2) only up to and incl. the time row when treatment escalation occurs
+# 3) all time rows for inactive baseline and not escalated
+
+treat.model.df = outcome.model.df %>%
+  left_join(switch_max_time, by='id') %>% distinct() %>%
+  filter(id %notin% new_ec_post_active | (id %in% new_ec_post_active & tstop <= max_tstop)) %>%
+  dplyr::select(-max_tstop) %>%
+  
+  mutate(include = case_when(id %in% new_ec_active & time == 0 ~ 1,
+                             id %notin% new_ec_active ~ 1,
+                             TRUE ~ 0)) %>%
+  filter(include == 1) %>% dplyr::select(-include)
+
+# convert tbl --> data.frame for compatibility 
+treat.model.df = as.data.frame(treat.model.df)
+```
+
+
+*see distributions of treatment escalation*
+```{r, fig.height = 5, fig.width = 8}
+n_switch = outcome.model.df %>%
+  filter(id %in% new_ec_post_active) %>% distinct(id) %>% nrow(.)
+
+n_inact_base = outcome.model.df %>%
+  filter(id %notin% new_ec_active) %>% distinct(id) %>% nrow(.)
+
+t_to_switch = outcome.model.df %>%
+  mutate(treat_up = as.numeric(as.character(treat_up))) %>%
+  filter(id %in% new_ec_post_active) %>%
+  filter(treat_up == 1) %>%
+  group_by(id) %>%
+  arrange(id, time) %>%
+  slice(1) %>%
+  mutate(max_tstop = tstart) %>%
+  
+  group_by(time) %>% summarise(sum = sum(treat_up)) %>%
+  rbind(c(15, 0)) %>% rbind(c(16, 0)) %>% rbind(c(17, 0)) %>% rbind(c(18,0)) %>% rbind(c(19,0)) %>%
+  ggplot(aes(x=time, y=sum)) + geom_bar(stat = 'identity', fill='steelblue') + 
+  labs(x = 'time intervals', y='n episodes with switch to active antibiotics', 
+       title = paste0(n_switch, '/',n_inact_base,' switch to active antibiotics after baseline')
+       ) + 
+  theme(panel.background = element_blank(), panel.grid.major = element_line(colour = "grey95"))
+  
+t_to_switch
+```
+
+
+***ONLY UP TO TSTART = 10 DUE TO SPARSITY***
+```{r}
+end_tstart = 10
+
+new.treat.df = treat.model.df %>%
+  filter(tstart <= end_tstart)
+```
+
+
+*obtain knot values for continuous variables*
+```{r}
+# code to generate splines for continuous variables
+other_cont = c('AgeAtAdmission', 'BMI', 'news_score', 'news_score_base')
+cont_vars = c(labs_var, obs_var[obs_var %notin% c('AVPU', 'SupplementaryOxygen')],
+              labs_var_base, obs_var_base[obs_var_base %notin% c('AVPU_base', 'SupplementaryOxygen_base')], 
+              other_cont)
+
+var_quants = list()
+for (i in seq_along(cont_vars)){
+  var = cont_vars[[i]]
+  var_str = as.character(var)
+
+  qs = unname(quantile(new.treat.df[[var]], probs = c(0.1, 0.5, 0.9)))
+  
+  var_quants[[var_str]] <- qs
+  
+}
+```
+
+
+```{r}
+# treatment model
+model_num <- glm(num_model.formula,
+                 data = new.treat.df, family = binomial(link = "logit"))
+
+model_denom <- glm(denom_model.formula,
+                   data = new.treat.df, family = binomial(link = "logit"))
+
+# compute IPTW
+iptw_manual <- as.data.frame(treat.all.arms)
+iptw_manual$propensity_num = predict(model_num, iptw_manual, type='response')
+iptw_manual$propensity_denom = predict(model_denom, iptw_manual, type='response')
+
+iptw_manual = iptw_manual %>%
+  
+  # Probability of observed outcome
+  mutate(propensity_num_outcome = ifelse(treat_up == 1, propensity_num, 1 - propensity_num),
+         propensity_denom_outcome = ifelse(treat_up == 1, propensity_denom, 1 - propensity_denom)) %>% 
+  # Numerator / denominator
+  mutate(weights_no_time = propensity_num_outcome / propensity_denom_outcome) %>% 
+  group_by(id, arm) %>% 
+  mutate(ipw_manual = cumprod(weights_no_time)) %>% 
+  mutate(ipw_manual = round_half_up(ipw_manual, digits = 6)) %>%
+  ungroup() %>%
+  mutate(base_treatment = case_when(treat_base == 1 ~ 'active',
+                                    treat_base == 0 ~ 'inactive'),
+         base_treatment = factor(base_treatment, levels = c('active', 'inactive')))
+
+
+head(iptw_manual, 3)
+summary(iptw_manual$ipw_manual) 
+```
+
+*attach IPTWs to corresponding clones*
+```{r}
+end_tstart = 10
+
+# add weights to person-time data
+iptw_link = iptw_manual %>%
+  # only cases to time <=10 due to data sparsity beyond
+  filter(tstart <= end_tstart) %>%
+  dplyr::select(arm, id, time, ipw_manual) 
+
+arm0.outcome = treat.arm0 %>% 
+  filter(id %notin% arm0$id) %>%
+  rbind(arm0) %>%
+  arrange(arm, id, time)
+
+all.arms.outcome <- all.arms %>%
+  select(-my.censor) %>%
+  filter(arm != 0) %>%
+  rbind(arm0.outcome) %>%
+  arrange(arm, id, time)
+  
+all.arms.outcome.iptw <- all.arms.outcome %>%
+  left_join(iptw_link, by=c('arm', 'id', 'time')) %>% distinct() %>%
+  group_by(arm, id) %>%
+  arrange(arm, id, time) %>%
+  fill(ipw_manual, .direction = 'down') %>% ungroup() %>%
+  assert(not_na, ipw_manual)
+```
+
+
+
+*fit outcome model*
+```{r}
+arm_factored = all.arms.outcome.iptw %>% 
+  mutate(arm = as.factor(arm))
+
+arm_factored = as.data.frame(arm_factored)
+
+options(warn=-1) # Suppress warning messages
+
+multi.arm.wt.fit <- glm(formula = death==1 ~  arm + ns(time, knots = c(3, 4, 5, 8, 12), Boundary.knots = c(2, 16)),
+                
+                        family = binomial(link = 'logit'),
+                        data = arm_factored,
+                        weights = ipw_manual)
+
+# Print results 
+summary(multi.arm.wt.fit)
+
+exp(cbind(OR = coef(multi.arm.wt.fit), confint(multi.arm.wt.fit)))
+
+robust_se(multi.arm.wt.fit)
+options(warn=-0) 
+```
+
+
+##[b] Separate treat model by time interval
+```{r}
+options(warn=-1) # Suppress warning messages
+
+time_treat_ipws = list()
+# other arms
+for(i in seq(0, 10, 1)){
+  
+  t_df = new.treat.df %>%
+    filter(time == i)
+  
+  t_num <- glm(num_model.formula,
+                 data = t_df, family = binomial(link = "logit"))
+
+  if(i <= 4){
+    t_denom.formula = update(denom_model.formula, .~. -last24h_crp_post24_3L -last24h_crp_post24_3L*ns(time, knots = c(2, 3, 6, 8), Boundary.knots = c(1, 10)))
+  }else{
+    t_denom.formula = denom_model.formula
+  }
+  
+  t_denom <- glm(t_denom.formula,
+                     data = t_df, family = binomial(link = "logit"))
+  
+  # compute IPTW
+  t.ipw <- as.data.frame(t_df)
+  t.ipw$propensity_num = predict(t_num, t.ipw, type='response')
+  t.ipw$propensity_denom = predict(t_denom, t.ipw, type='response')
+  
+  t.ipw = t.ipw %>%
+    
+    # Probability of observed outcome
+    mutate(propensity_num_outcome = ifelse(treat_up == 1, propensity_num, 1 - propensity_num),
+           propensity_denom_outcome = ifelse(treat_up == 1, propensity_denom, 1 - propensity_denom)) %>% 
+    # Numerator / denominator
+    mutate(weights_no_time = propensity_num_outcome / propensity_denom_outcome) %>% 
+    mutate(base_treatment = case_when(treat_base == 1 ~ 'active',
+                                      treat_base == 0 ~ 'inactive'),
+           base_treatment = factor(base_treatment, levels = c('active', 'inactive')))
+  
+  time_treat_ipws[[i+1]] <- t.ipw
+    
+}
+
+all.times.ipws = bind_rows(time_treat_ipws) %>%
+  verify(nrow(.) == nrow(new.treat.df)) %>%
+  assert(not_na, weights_no_time) %>%
+  
+  group_by(id) %>% 
+  mutate(ipw_manual = cumprod(weights_no_time)) %>%
+  mutate(ipw_manual = round_half_up(ipw_manual, digits = 6)) %>%
+  ungroup()
+  
+all.times.ipws %>% select(id, ipw_manual) %>% summary(.)
+
+# truncate at 1+99th centiles
+threshold_99 <- quantile(all.times.ipws$ipw_manual, 0.99)[[1]]
+threshold_1 <- quantile(all.times.ipws$ipw_manual, 0.01)[[1]]
+all.times.ipws$sw_1_99 <- all.times.ipws$ipw_manual
+# treat_elig$sw_1_99[treat_elig$sw_99 > threshold_99] <- threshold_99
+all.times.ipws = all.times.ipws %>% mutate(sw_1_99 = case_when(sw_1_99 > threshold_99 ~ threshold_99,
+                                                       sw_1_99 < threshold_1 ~ threshold_1,
+                                                       TRUE ~ sw_1_99))
+
+all.times.ipws %>% select(id, ipw_manual, sw_1_99) %>% summary(.)
+
+cat(paste("sd for untruncated ipw:",sd(all.times.ipws$ipw_manual)))
+cat(paste("sd for truncated ipw:", sd(all.times.ipws$sw_1_99)))
+
+options(warn=-0) # Suppress warning messages
+```
+
+*plot IPTWs across time*
+```{r, fig.height = 8, fig.width = 12}
+# plot IPWs by time point
+iptw_means = compute_iptw_means(all.times.ipws)
+
+p = plot_iptws(all.times.ipws, iptw_means) +
+  scale_y_continuous(breaks = c(0, 1, 2, 3, 4, 5), limits = c(0, 5.5) ) +
+  labs(
+      # title = paste0('[IPTW]: mean = ', mean(all.times.ipws$ipw_manual),
+                      # ' sd = ', sd(all.times.ipws$ipw_manual)), 
+       x='time intervals', y='IPTW') +
+  theme_minimal()
+
+# plot IPWs by antibiotic activity
+p2 = ggplot(subset(all.times.ipws, base_treatment == 'active'), 
+                       aes(x = propensity_denom, fill = base_treatment)) +
+                       geom_histogram(aes(y = ..density..), binwidth=0.01, show.legend=FALSE) + 
+                       geom_histogram(data = subset(all.times.ipws, base_treatment == 'inactive'),
+                       aes(x = propensity_denom, y = - ..density.., fill = base_treatment), binwidth=0.01, show.legend=FALSE) + 
+                       ylab("Density (%)") + 
+                       xlab("probability of receiving active treatment") + 
+                       # ggtitle("Propensity scores in active and Inactive Baseline\n(Density histogram)") + 
+                       scale_fill_discrete(name = "Baseline antibiotic activity") +
+  scale_y_continuous(limits = c(-6, 8), breaks = seq(-6, 8, 2)) +
+  theme_minimal()
+
+p3 = ggplot(subset(all.times.ipws, base_treatment == 'active'), 
+                       aes(x = ipw_manual, fill = base_treatment)) +
+                       geom_histogram(aes(y = ..density..), binwidth=0.01) + 
+                       geom_histogram(data = subset(all.times.ipws, base_treatment == 'inactive'),
+                       aes(x = ipw_manual, y = - ..density.., fill = base_treatment), binwidth=0.01) + 
+                       ylab("Density (%)") + 
+                       xlab("IPTW") + 
+                       # ggtitle("IPTW in Active and Inactive Baseline\n(Density Histogram)") + 
+                       scale_fill_discrete(name = "Baseline antibiotic activity") +
+  # scale_y_continuous(limits = c(-6, 11), breaks = seq(-6, 10, 2)) +
+  theme_minimal()
+
+mean(all.times.ipws$ipw_manual)
+sd(all.times.ipws$ipw_manual)
+
+(p2 | p3) / p +
+  plot_annotation(tag_levels = 'A')
+```
+
+*add IPTWs to each clone*
+```{r}
+end_tstart = 10
+
+# add weights to person-time data
+all.times.iptw_link = all.times.ipws %>%
+  # only cases to time <=10 due to data sparsity beyond
+  filter(tstart <= end_tstart) %>%
+  dplyr::select(id, time, ipw_manual, sw_1_99) %>%
+  rename("ipw_by_time" = "ipw_manual",
+         "sw_1_99_by_time" = "sw_1_99")
+
+all.arms.outcome.iptw = all.arms.outcome.iptw %>% 
+  left_join(all.times.iptw_link, by=c('id', 'time')) %>% distinct() %>% 
+  group_by(arm, id) %>%
+  arrange(arm, id, time) %>% 
+  fill(ipw_by_time, sw_1_99_by_time, .direction = 'down') %>% ungroup() %>%
+  assert(not_na, ipw_by_time)
+
+all.arms.outcome.iptw %>%
+  select(id, arm, time,  ipw_manual, sw_1_99_by_time, ipw_by_time) %>% 
+  summary(.)
+```
+
+*using untruncated IPTWs*
+```{r}
+arm_factored = all.arms.outcome.iptw %>% 
+  mutate(arm = as.factor(arm))
+
+arm_factored = as.data.frame(arm_factored)
+
+options(warn=-1) # Suppress warning messages
+
+fit.by.time <- glm(formula = death==1 ~  arm + ns(time, knots = c(3, 4, 5, 8, 12), Boundary.knots = c(2, 16)),
+                
+                        family = binomial(link = 'logit'),
+                        data = arm_factored,
+                        weights = ipw_by_time)
+
+# Print results 
+summary(fit.by.time)
+
+exp(cbind(OR = coef(fit.by.time), confint(fit.by.time)))
+
+robust_se(fit.by.time)
+options(warn=-0) 
+```
+
+*using truncated IPTWs*
+```{r}
+options(warn=-1) # Suppress warning messages
+
+trunc.fit.by.time <- glm(formula = death==1 ~  arm + ns(time, knots = c(3, 4, 5, 8, 12), Boundary.knots = c(2, 16)),
+                
+                        family = binomial(link = 'logit'),
+                        data = arm_factored,
+                        weights = sw_1_99_by_time)
+
+# Print results 
+summary(trunc.fit.by.time)
+
+exp(cbind(OR = coef(trunc.fit.by.time), confint(trunc.fit.by.time)))
+
+robust_se(trunc.fit.by.time)
+options(warn=-0) 
+```
+
+
+*using untruncated with time interaction*
+```{r}
+options(warn=-1) # Suppress warning messages
+
+fit.by.time <- glm(formula = death==1 ~  arm + ns(time, knots = c(3, 4, 5, 8, 12), Boundary.knots = c(2, 16))
+                   + arm*ns(time, knots = c(3, 4, 5, 8, 12), Boundary.knots = c(2, 16)),
+                
+                        family = binomial(link = 'logit'),
+                        data = arm_factored,
+                        weights = ipw_by_time)
+
+# Print results 
+summary(fit.by.time)
+
+exp(cbind(OR = coef(fit.by.time), confint(fit.by.time)))
+
+robust_se(fit.by.time)
+options(warn=-0)
+```
+
+
+*using truncated with time interaction*
+```{r}
+options(warn=-1) # Suppress warning messages
+
+trunc.fit.by.time <- glm(formula = death==1 ~  arm + ns(time, knots = c(3, 4, 5, 8, 12), Boundary.knots = c(2, 16))
+                         + arm*ns(time, knots = c(3, 4, 5, 8, 12), Boundary.knots = c(2, 16)),
+                
+                        family = binomial(link = 'logit'),
+                        data = arm_factored,
+                        weights = sw_1_99_by_time)
+
+# Print results 
+summary(trunc.fit.by.time)
+
+exp(cbind(OR = coef(trunc.fit.by.time), confint(trunc.fit.by.time)))
+
+robust_se(trunc.fit.by.time)
+options(warn=-0) 
+```
+
+
+
