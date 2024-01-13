@@ -1,0 +1,642 @@
+---
+title: "cluster_sepsis.Rmd"
+author: "Chang Ho Yoon"
+date: "13/01/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+### load dependencies
+# basic
+library(tidyverse)
+library(gtsummary)
+library(assertr)
+library(glue)
+library(forcats)
+
+# data preprocessing and analysis
+library(caret)
+library(fastDummies)
+library(bestNormalize)
+library(modeldata)
+library(ppcor)
+library(mice)
+library(GGally)
+
+# clustering-related
+library(cluster)
+library(fpc)
+library(factoextra)
+library(ppclust)
+library(NbClust)
+library(ConsensusClusterPlus)
+library(ggplot2)
+library(ggthemes)
+library(scales)
+library(cowplot)
+library(boot)
+library(MASS)
+
+# data visualisation
+library(RColorBrewer)
+library(wordcloud)
+library(reshape2)
+
+# create additional custom commands
+`%notin%` <- Negate(`%in%`)
+`%notwithin%` <- Negate(`%within%`)
+`%+%` <- ggplot2::`%+%`
+
+# import functions
+source("utils/cluster_utils.R")
+source("utils/sepsis_utils.R")
+```
+
+*import data*
+```{r}
+# load cleaned dataframe for patients satisfying sepsis-3 criteria as detailed
+# in Seymour et al. (2019), from user's own local directory
+
+# sepsis_pre_analysis_df <- read_csv('#####/#####.csv', guess_max = 1e6)
+```
+
+###Select variables as per Seymour et al. paper (2019)
+```{r}
+### sepsis variables
+categorical_variables <- c('LinkedSex')
+
+continuous_variables <- c('AgeAtAdmission', 'albumin', 'alt', 'ast', 'bicarbonate', 
+                          'bilirubin', 'urea', 'chloride', 'crp', 'creatinine',
+                          'Elixhauser', 'esr', 'GCS', 'glucose', 'HeartRate', 
+                          'haemoglobin', 'immature_granulocytes', 'inr', 'lactate', 
+                          'OxygenSaturation', 'po2', 'platelets', 'RespiratoryRate', 
+                          'sodium', 'SBP', 'Temperature', 'troponin', 'white_cells')
+
+# all predictor variables
+sepsis_vars <- c(categorical_variables, continuous_variables)
+
+outcome_variables <- c('OverallSurvival_days_adjusted', 'OverallSurvival_days_capped', 
+                       'CensorStatus_day30', 'CensorStatus_day365', 'LengthOfStayFromCulture')
+
+model_variables <- c(sepsis_vars, outcome_variables)
+
+# number of variables:
+cat(paste('total number of variables:', length(sepsis_vars)+length(outcome_variables)))
+```
+
+Proportions of missingness by variable
+```{r}
+# from Sepsis et al. (2019) supplement
+variables = c('AgeAtAdmission', 'LinkedSex', 'albumin', 'alt', 'ast', 'bicarbonate', 
+              'bilirubin', 'urea', 'chloride', 'crp', 'creatinine',
+              'Elixhauser', 'esr', 'GCS', 'glucose', 'HeartRate', 'haemoglobin', 
+              'immature_granulocytes', 'inr', 'lactate', 'OxygenSaturation', 'po2',
+              'platelets', 'RespiratoryRate', 'sodium', 'SBP', 'Temperature', 
+              'troponin', 'white_cells')
+
+values = c(0, 0, 12139, 11707, 11714, 6586, 11763, 6962, 6428, 19769, 6647,
+           0, 19596, 14271, 6102, 260, 6258, 17303, 11824, 16180, 458, 16161,
+           7024, 448, 6074, 262, 1357, 15757, 7102)
+
+sepsis_missingness_df = as.data.frame(variables)
+colnames(sepsis_missingness_df) = c("variable")
+sepsis_missingness_df$value = values
+
+sepsis_missingness_df$total_n = 20189
+
+sepsis_missingness_df <- sepsis_missingness_df %>%
+  mutate(prop = 100*(value/total_n)) %>%
+  mutate(dataset = 'sepsis')
+
+# missingness in IORD
+iord_n = nrow(sepsis_pre_analysis_df)
+
+iord_missing <- sepsis_pre_analysis_df %>%
+  summarise_all(list(~sum(is.na(.)))) %>%
+  pivot_longer(everything()) %>%
+  rename('variable' = 'name') %>%
+  mutate(total_n = iord_n) %>%
+  mutate(prop = 100*(value/total_n)) %>%
+  filter(variable %in% sepsis_vars) %>%
+  mutate(dataset = 'iord')
+
+# plot missingness
+missing_plot <- rbind(iord_missing, sepsis_missingness_df)
+
+missing_plot %>%
+  arrange(desc(dataset), desc(value)) %>%
+  ggplot(aes(x=variable, y=prop, fill=dataset)) +
+  geom_bar(position='dodge', stat='identity') +
+  aes(x = fct_inorder(variable)) +
+  labs(title = 'comparing missingness', 
+       x = 'variable',
+       y = '% missing') + 
+  theme(axis.text.x = element_text(angle = 60, vjust=1, hjust=1))
+```
+
+###Prepare clustering dataframe
+```{r}
+# winsorise/truncate
+# symmetrical winsorisation: for continuous covariates with a natural limit
+sym_wins_vars <- c('AgeAtAdmission',
+                   'SBP', 'HeartRate', 'RespiratoryRate', 'Temperature', 'GCS',
+                   'Elixhauser', 'sodium', 'albumin', 'creatinine', 'haemoglobin', 
+                   'glucose', 'lactate', 'po2', 'bicarbonate', 'chloride')
+
+# asymmetrical winsorisation: for continuous covariates without a natural limit 
+asym_wins_upper_vars <- c('bilirubin', 'alt', 'ast', 'urea', 'crp', 'troponin', 'inr', 
+                          'immature_granulocytes', 'white_cells')
+asym_wins_lower_vars <- c('OxygenSaturation')
+
+residual_cont_vars <- continuous_variables[continuous_variables %notin% c(sym_wins_vars, asym_wins_lower_vars, asym_wins_upper_vars)]
+
+cat('\n\ncovariates without winsorisation:', paste(residual_cont_vars, collapse = ' + '),'\n')
+
+# make dataframe with truncated variables
+unfiltered_cluster_df <- make_survival_df_sepsis(sepsis_pre_analysis_df, winsorise_continuous = TRUE, 
+                                                sym_wins_vars = sym_wins_vars, sym_limits = c(0.025, 0.975), 
+                                                asym_upper_vars = asym_wins_upper_vars, asym_upper_limits = c(0, 0.95),
+                                                asym_lower_vars = asym_wins_lower_vars, asym_lower_limits = c(0.05, 1))
+
+unfiltered_incomplete_cluster_df <- unfiltered_cluster_df[, c('ClusterID', 'SpellID', 'CulturePositive', outcome_variables,  sepsis_vars)]
+
+summary(unfiltered_incomplete_cluster_df)
+```
+
+Random forest imputation of missing values
+```{r}
+set.seed = 12081023
+n.features = 29
+pre_impute_df <- unfiltered_incomplete_cluster_df %>%
+  select(-outcome_variables[outcome_variables %notin% c('CensorStatus_day30')], -ClusterID, -SpellID, -CulturePositive)
+
+# complete data by chained random forest
+### ideally this should be performed 10+ times with mean values taken
+data.imputed <- missRanger(pre_impute_df, pmm.k=5, num.trees=1000, seed=set.seed)
+
+# create new unique ID
+unfiltered_incomplete_cluster_df <- unfiltered_incomplete_cluster_df %>%
+  rowid_to_column(., 'id')
+
+data.imputed <- data.imputed %>% select(-CensorStatus_day30)
+data.imputed$id <- unfiltered_incomplete_cluster_df$id
+data.imputed <- data.imputed[,c(n.features+1,1:n.features)]
+
+# save imputed csv
+# write_csv(data.imputed, '#####/imputed_sepsis_29.csv')
+```
+
+Yeo-Johnson normalization with standardization + dummy variables/one-hot encoding
+```{r, fig.width=22,fig.height=22}
+norm_stand_data = yeo_transform(data.imputed, continuous_variables, standardise = TRUE)
+
+# one-hot encode all categorical using fastDummies
+one_hot_df <- dummy_cols(norm_stand_data, select_columns = c(categorical_variables), remove_first_dummy = TRUE, remove_selected_columns = TRUE)
+
+# remove outcome and id variables
+cluster_data <- one_hot_df
+```
+
+
+###Clustering
+```{r}
+# Consensus clustering for optimal k clusters
+values_only <- data.matrix(cluster_data)
+values_only = values_only[, c(1:n.features+1)]
+
+consensus_clusters = ConsensusClusterPlus(values_only,
+                                          maxK=10, # max k clusters
+                                          reps=1000, # number of sub-samples
+                                          pItem=1, # 100% item resampling = columns = variables
+                                          pFeature=0.8, # 100% of features to sample = rows = patients
+                                          title="hard k-means",
+                                          distance="euclidean",
+                                          plot = "pdf",   # save plots as PDF
+                                          clusterAlg="km"
+                                          
+                                          )
+
+print('done')  # to remove verbose output
+```
+
+Alternatively, optimal k clusters by majority rule
+```{r}
+nb <- NbClust(values_only,
+              distance = "euclidean",
+              method = "kmeans",
+              min.nc=2, max.nc=10,
+              index = "all")
+
+hist(nb$Best.nc[1,], 
+     breaks = max(na.omit(nb$Best.nc[1,])),
+     main = "majority method of optimal k for k-means",
+     xlab = 'k',
+     fill = NULL)
+
+# prettify histogram
+opt_k = tibble('method' = names(nb$Best.nc[1,]),
+               'k' = unname(nb$Best.nc[1,]))
+
+opt_k %>%
+  filter(k>0) %>%
+  ggplot(aes(k)) + 
+  geom_histogram(binwidth=1, fill='steelblue') +
+  labs(title = 'majority method of optimal k for k-means', xlab = 'k') +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  scale_y_continuous(breaks = seq(0, 10, 2)) +
+  theme_minimal()
+```
+
+
+###sepsis_29 (Seymour-29 in thesis): Clusters using k=4 
+*hard k-means cluster assignment to dataset*
+```{r}
+sepsis_29_df <- cluster_data %>% select(-id)
+custom_colors <- c("#F8766D", "#7DAE01", "#00BFC4", "#C77CFF")
+names(custom_colors) <- c("1", "2", "3", "4")
+
+# run k-means clustering algorithm
+sepsis.29.km4 <- eclust(sepsis_29_df, "kmeans", k=4, nstart = 25, seed = 100)
+
+factoextra::fviz_cluster(sepsis.29.km4, data = sepsis_29_df, 
+  ellipse.type = "convex",
+  repel = TRUE) + scale_color_manual(values = custom_colors) + labs(title = 'sepsis emulation 29 variables') + theme_minimal()
+
+sepsis_29_df$cluster <- sepsis.29.km4$cluster
+
+# convert cluster to factor
+sepsis_29_df <- sepsis_29_df %>%
+  mutate(cluster = as.character(cluster)) %>%
+  mutate(cluster = factor(cluster, levels = c('1', '2', '3', '4')))
+
+# write_csv(sepsis_29_df, 'sepsis_vars_km_4.csv')
+
+summary(sepsis_29_df)
+```
+
+Repeat with fuzzy C-means algorithm
+```{r}
+sepsis_29_fuzzy_df <- cluster_data %>% select(-id) 
+
+fcm.29.k4 <- fcm(sepsis_29_fuzzy_df, m=1.1, centers=4, nstart=25, fixcent = TRUE, numseed = 100)
+summary(fcm.29.k4)
+
+# plot clusters
+fcm.29.k4.plot <- ppclust2(fcm.29.k4, "kmeans")
+
+custom_colors <- c("#F8766D", "#7DAE01", "#00BFC4", "#C77CFF")
+names(custom_colors) <- c("1", "2", "3", "4")
+
+factoextra::fviz_cluster(fcm.29.k4.plot, data = values_only, 
+  ellipse.type = "convex",
+  repel = TRUE) + scale_color_manual(values = custom_colors) + labs(title = 'soft k-means')
+```
+
+
+###sepsis_21 (Seymour-29 minus 8 variables with missingness >15%)
+Identify variables with missingness >15% and prepare dataset
+```{r}
+# highly missing variables
+highly_missing = iord_missing %>%
+  filter(prop >= 15 & variable != 'GCS') %>%   # GCS is at cut-off of 15% 
+  .$variable
+
+# new dataframe
+sub_incomplete_df = unfiltered_incomplete_cluster_df %>%
+  select(-all_of(highly_missing))
+
+# random forest multiple imputation
+set.seed = 12081023
+n.features = 29 - length(highly_missing)
+
+pre_impute_df.minus_missing <- sub_incomplete_df %>%
+  select(-outcome_variables[outcome_variables %notin% c('CensorStatus_day30')], -ClusterID, -SpellID, -CulturePositive)
+
+# impute missing values using random forest multiple imputation
+data.imputed.minus_missing <- missRanger(pre_impute_df.minus_missing, 
+                                         pmm.k=5, 
+                                         num.trees=1000, 
+                                         seed=set.seed)
+
+# create new unique ID
+sub_incomplete_df <- sub_incomplete_df %>%
+  rowid_to_column(., 'id')
+
+data.imputed.minus_missing <- data.imputed.minus_missing %>% select(-CensorStatus_day30)
+data.imputed.minus_missing$id <- sub_incomplete_df$id
+data.imputed.minus_missing <- data.imputed.minus_missing[,c(n.features+1,1:n.features)]
+
+# normalisation, standardisation
+continuous_variables <- continuous_variables[continuous_variables %notin% highly_missing]
+
+norm_stand_data = yeo_transform(data.imputed, continuous_variables, standardise = TRUE)
+
+# one-hot encode all categorical using fastDummies
+one_hot_df <- dummy_cols(norm_stand_data, 
+                         select_columns = c(categorical_variables), 
+                         remove_first_dummy = TRUE, 
+                         remove_selected_columns = TRUE)
+
+# remove outcome and id variables
+cluster_data <- one_hot_df 
+```
+
+run clustering
+```{r}
+sepsis_21_df<- cluster_data %>% select(-id)
+custom_colors <- c("#F8766D", "#7DAE01", "#00BFC4", "#C77CFF")
+names(custom_colors) <- c("1", "2", "3", "4")
+
+sepsis.21.km4 <- eclust(sepsis_21_df, "kmeans", k=4, nstart = 25, seed = 100)
+
+sepsis_21_df$cluster <- sepsis.21.km4$cluster
+
+# convert cluster to factor
+sepsis_21_df <- sepsis_21_df %>%
+  mutate(cluster = as.character(cluster)) %>%
+  mutate(cluster = factor(cluster, levels = c('1', '2', '3', '4')))
+```
+
+
+
+###sepsis_71 (all 71 variables in IORD data) using k=4
+
+*set variables*
+```{r}
+### ALL VARIABLES
+categorical_variables <- c('LinkedSex', 'Ethnicity', 
+                           'SpecialtyGroup', 
+                           'AdmissionTimeOfDay', 'AdmissionDayOfWeek', 'OutOfHoursAdmission', 
+                           'PriorHospitalisation', 'diabetes', 'dialysis', 'palliative', 
+                           'immunosuppression', 'SupplementaryOxygen', 'AVPU',
+                           'CommunityOnset', 
+                           'urinary_source', 'respiratory_source', 'abdominal_source', 
+                           'other_source', 'cns_source', 'skin_soft_tissue_orthopedic_source', 
+                           'unspecific_source', 'unknown_source'
+                           )
+
+continuous_variables <- c('AgeAtAdmission', 'Height', 'BMI', 'Weight', 'preAdmissionDays', 
+                          'IMDPercentile', 'Charlson', 'Elixhauser', 
+                          'SBP', 'DBP', 'GCS', 'HeartRate', 'RespiratoryRate', 
+                          'OxygenSaturation', 'Temperature', 
+                          'albumin', 'alkaline_phosphatase', 'alt', 'aptt', 'ast', 
+                          'bicarbonate', 'bilirubin', 'calcium_adjusted', 'chloride', 
+                          'creatinine', 'crp', 'eosinophils', 'esr', 'glucose', 
+                          'haematocrit', 'haemoglobin', 'immature_granulocytes', 
+                          'inr', 'lactate', 'lymphocytes', 'magnesium', 'mch', 
+                          'mcv', 'monocytes', 'neutrophils', 'phosphate', 
+                          'platelets', 'po2', 'potassium', 'pt', 'sodium', 
+                          'troponin', 'urea', 'white_cells'
+                          )
+
+# all predictor variables
+predictor_variables <- c(categorical_variables, continuous_variables)
+
+outcome_variables <- c('OverallSurvival_days_adjusted', 'OverallSurvival_days_capped', 
+                       'CensorStatus_day30', 'CensorStatus_day365', 'LengthOfStayFromCulture')
+
+model_variables <- c(predictor_variables, outcome_variables)
+```
+
+Prepare data: truncate & impute
+```{r}
+##################### Truncation
+# symmetrical winsorisation: for continuous covariates with a natural limit
+sym_wins_vars <- c('AgeAtAdmission', 'Height', 'BMI', 'Weight', 'IMDPercentile',
+                   'SBP', 'DBP', 'HeartRate', 'RespiratoryRate', 'Temperature', 
+                  'Elixhauser', 'Charlson',
+                   'sodium', 'albumin', 'bicarbonate', 'calcium_adjusted', 
+                  'chloride', 'esr', 'glucose', 'haemoglobin', 'haematocrit', 
+                  'glucose', 'lactate', 'magnesium', 'mch', 'mcv', 'phosphate', 
+                  'po2', 'potassium')
+
+# asymmetrical winsorisation: for continuous covariates without a natural limit 
+asym_wins_upper_vars <- c('bilirubin', 'alkaline_phosphatase', 'alt', 'aptt', 
+                          'ast',  'creatinine', 'urea', 'crp', 'troponin', 'inr', 
+                          'pt', 'lactate', 'eosinophils', 'immature_granulocytes', 
+                          'lymphocytes', 'monocytes', 'neutrophils', 'platelets', 
+                          'white_cells', 'preAdmissionDays')
+asym_wins_lower_vars <- c('OxygenSaturation', 'GCS')
+
+residual_cont_vars <- continuous_variables[continuous_variables %notin% c(sym_wins_vars, asym_wins_lower_vars, asym_wins_upper_vars)]
+
+cat('\n\ncovariates without winsorisation:', paste(residual_cont_vars, collapse = ' + '),'\n')
+
+unfiltered_cluster_df <- make_survival_df_sepsis_plus(sepsis_pre_analysis_df, winsorise_continuous = TRUE, 
+                                                      sym_wins_vars = sym_wins_vars, sym_limits = c(0.025, 0.975), 
+                                                      asym_upper_vars = asym_wins_upper_vars, asym_upper_limits = c(0, 0.95),
+                                                      asym_lower_vars = asym_wins_lower_vars, asym_lower_limits = c(0.05, 1))
+
+unfiltered_incomplete_cluster_df <- unfiltered_cluster_df[, c('ClusterID', 'SpellID', outcome_variables,  predictor_variables)]
+
+##################### Multiple imputation 
+set.seed = 12081023
+
+pre_impute_df <- unfiltered_incomplete_cluster_df %>%
+  select(-outcome_variables[outcome_variables %notin% c('CensorStatus_day30')], -ClusterID, -SpellID)
+
+n.features = ncol(pre_impute_df[, c(2:ncol(pre_impute_df))])
+
+# complete data by MICE
+### ideally this should be performed >10 times with means of values taken
+data.imputed.plus <- missRanger(pre_impute_df, pmm.k=5, num.trees=1000, seed=set.seed)
+
+# create new unique ID
+unfiltered_incomplete_cluster_df <- unfiltered_incomplete_cluster_df %>%
+  rowid_to_column(., 'id')
+
+data.imputed.plus <- data.imputed.plus %>% select(-CensorStatus_day30)
+data.imputed.plus$id <- unfiltered_incomplete_cluster_df$id
+data.imputed.plus <- data.imputed.plus[,c(n.features+1,1:n.features)]
+
+head(data.imputed.plus, 3)
+```
+
+Prepare data: yeo-johnson transformation + standardisation for continuous_variables
+- dummy variables for categorical (one-hot encoding)
+```{r}
+data.imputed.plus.std = yeo_transform(data.imputed.plus, 
+                                      continuous_variables, 
+                                      standardise = TRUE)
+
+# one-hot encode all categorical using fastDummies
+data.imputed.plus.std.onehot <- dummy_cols(data.imputed.plus.std, 
+                                           select_columns = c(categorical_variables), 
+                                           remove_first_dummy = TRUE, 
+                                           remove_selected_columns = TRUE)
+
+# remove outcome and id variables
+data.imputed.plus.std.onehot <- data.imputed.plus.std.onehot %>% select(-id)
+```
+
+
+###Optimal number of k for k-means
+*consensus clusters approach*
+```{r}
+values_only <- data.matrix(data.imputed.plus.std.onehot)
+colnames(values_only) <- NULL
+values_only
+
+consensus_clusters = ConsensusClusterPlus(values_only,
+                                          maxK=10, # max k clusters
+                                          reps=1000, # number of sub-samples
+                                          pItem=1, # 100% item resampling = columns = variables
+                                          pFeature=0.8, # 100% of features to sample = rows = patients
+                                          title="hard k-means",
+                                          distance="euclidean",
+                                          plot = "pdf",   # save plots as PDF
+                                          clusterAlg="km"
+                                          
+                                          )
+
+consensus_clusters
+print('done') # to remove verbose output
+```
+
+*by majority rule*
+```{r}
+nb <- NbClust(values_only,
+              distance = "euclidean",
+              method = "kmeans",
+              min.nc=2, max.nc=10,
+              index = "all")
+
+hist(nb$Best.nc[1,], 
+     breaks = max(na.omit(nb$Best.nc[1,])),
+     main = "majority method of optimal k for k-means",
+     xlab = 'k',
+     fill = NULL)
+
+# prettify histogram
+opt_k = tibble('method' = names(nb$Best.nc[1,]),
+               'k' = unname(nb$Best.nc[1,]))
+
+opt_k %>%
+  filter(k>0) %>%
+  ggplot(aes(k)) + 
+  geom_histogram(binwidth=1, fill='steelblue') +
+  labs(title = 'majority method of optimal k for k-means', xlab = 'k') +
+  scale_x_continuous(breaks = seq(0, 10, 1)) +
+  scale_y_continuous(breaks = seq(0, 10, 2)) +
+  theme_minimal()
+```
+
+*apply hard k-means cluster assignment to dataset according to optimal k*
+```{r}
+custom_colors <- c("#F8766D", "#7DAE01", "#00BFC4", "#C77CFF")
+names(custom_colors) <- c("1", "2", "3", "4")
+
+sepsis.plus.km4 <- eclust(data.imputed.plus.std.onehot, "kmeans", k=4, nstart = 25, seed = 100)
+
+# visualise clusters
+factoextra::fviz_cluster(sepsis.plus.km4, data = data.imputed.plus.std.onehot, 
+  ellipse.type = "convex",
+  repel = TRUE) + scale_color_manual(values = custom_colors) + labs(title = 'hard k-means')
+
+data.imputed.plus.std.onehot$cluster <- sepsis.plus.km4$cluster
+
+# convert cluster to factor
+data.imputed.plus.std.onehot <- data.imputed.plus.std.onehot %>%
+  mutate(cluster = as.character(cluster)) %>%
+  mutate(cluster = factor(cluster, levels = c('1', '2', '3', '4')))
+
+summary(data.imputed.plus.std.onehot)
+```
+
+
+###sepsis_61 (Seymour variables plus IORD minus 10 highly correlated)
+- remove highly correlated variables (|rho| >= 0.8)
+```{r}
+# highly correlated variables
+to_remove = c('Height', 'chloride', 'creatinine', 'haematocrit', 'mch', 'mcv', 'pt', 'white_cells', 'unknown_source_1', 'preAdmissionDays')
+n_to_remove = length(to_remove)
+
+# normalise, standardise
+data.imputed.plus.std = yeo_transform(data.imputed.plus, 
+                                      continuous_variables, 
+                                      standardise = TRUE)
+
+# one-hot encode all categorical using fastDummies
+data.imputed.plus.std.onehot <- dummy_cols(data.imputed.plus.std, 
+                                           select_columns = c(categorical_variables), 
+                                           remove_first_dummy = TRUE, 
+                                           remove_selected_columns = TRUE)
+
+# remove outcome and id variables
+data.imputed.plus.std.onehot <- data.imputed.plus.std.onehot %>% select(-id)
+
+# remove highly correlated variables
+data.imputed.plus.minus <- data.imputed.plus.std.onehot %>% select(-all_of(to_remove))
+```
+
+Run clustering
+```{r}
+custom_colors <- c("#F8766D", "#7DAE01", "#00BFC4", "#C77CFF")
+names(custom_colors) <- c("1", "2", "3", "4")
+
+sepsis.plus.minus.km4 <- eclust(data.imputed.plus.minus, "kmeans", k=4, nstart = 25, seed = 100)
+
+factoextra::fviz_cluster(sepsis.plus.minus.km4, data = data.imputed.plus.minus,
+  ellipse.type = "convex",
+  repel = TRUE)  +
+  labs(title = 'hard k-means') +
+  scale_color_manual(values = custom_colors)
+
+data.imputed.plus.minus$cluster <- sepsis.plus.minus.km4$cluster
+
+# convert cluster to factor
+data.imputed.plus.minus <- data.imputed.plus.minus %>%
+  mutate(cluster = as.character(cluster)) %>%
+  mutate(cluster = factor(cluster, levels = c('1', '2', '3', '4')))
+```
+
+
+
+###sepsis_29 + extra continuous variables only
+
+Set variables
+```{r}
+# set continuous variables 
+continuous_variables <- c(
+                          'AgeAtAdmission', 'BMI', 'Weight',  'IMDPercentile', 
+                          'Charlson', 'Elixhauser', 
+                          'SBP', 'DBP', 'GCS', 'HeartRate', 'RespiratoryRate', 
+                          'OxygenSaturation', 'Temperature', 
+                          'albumin', 'alkaline_phosphatase', 'alt', 'aptt', 'ast', 
+                          'bicarbonate', 'bilirubin', 'calcium_adjusted', 'crp',  
+                          'eosinophils', 'esr', 'glucose', 'haemoglobin', 
+                          'immature_granulocytes', 'inr', 'lactate', 'lymphocytes', 
+                          'magnesium',  'monocytes', 'neutrophils', 'phosphate', 
+                          'platelets', 'po2', 'potassium', 'sodium', 'troponin', 
+                          'urea'
+                          )
+
+example_cont_seymour_plus = data.imputed.plus.minus[, c(continuous_variables, "LinkedSex_M")]
+```
+
+Run clustering
+```{r}
+# run clustering
+custom_colors <- c("#F8766D", "#7DAE01", "#00BFC4", "#C77CFF")
+names(custom_colors) <- c("1", "2", "3", "4")
+
+seymour.plus.minus.cont.km4 <- eclust(example_cont_seymour_plus, 
+                                      "kmeans", 
+                                      k=4, 
+                                      nstart = 25, 
+                                      seed = 100)
+
+factoextra::fviz_cluster(seymour.plus.minus.cont.km4, data = example_cont_seymour_plus, 
+  ellipse.type = "convex",
+  repel = TRUE)  + 
+  labs(title = 'hard k-means') + 
+  scale_color_manual(values = custom_colors)
+
+example_cont_seymour_plus$cluster <- seymour.plus.minus.cont.km4$cluster
+
+# convert cluster to factor
+example_cont_seymour_plus <- example_cont_seymour_plus %>%
+  mutate(cluster = as.character(cluster)) %>%
+  mutate(cluster = factor(cluster, levels = c('1', '2', '3', '4')))
+```
+

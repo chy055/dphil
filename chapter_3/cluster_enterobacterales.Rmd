@@ -1,0 +1,542 @@
+---
+title: "cluster_enterobacterales.Rmd"
+author: "Chang Ho Yoon"
+date: "12/01/2024"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+### load dependencies
+# basic
+library(tidyverse)
+library(gtsummary)
+library(assertr)
+library(glue)
+library(forcats)
+
+# data preprocessing and analysis
+library(caret)
+library(fastDummies)
+library(bestNormalize)
+library(modeldata)
+library(ppcor)
+library(mice)
+library(GGally)
+
+# clustering-related
+library(cluster)
+library(fpc)
+library(factoextra)
+library(ppclust)
+library(NbClust)
+library(ConsensusClusterPlus)
+library(ggplot2)
+library(ggthemes)
+library(scales)
+library(cowplot)
+library(boot)
+library(MASS)
+
+# data visualisation
+library(RColorBrewer)
+library(wordcloud)
+library(reshape2)
+
+# create additional custom commands
+`%notin%` <- Negate(`%in%`)
+`%notwithin%` <- Negate(`%within%`)
+`%+%` <- ggplot2::`%+%`
+
+# import functions
+source("utils/cluster_utils.R")
+```
+
+*import data*
+```{r}
+### ALL VARIABLES
+categorical_variables <- c('LinkedSex', 'Ethnicity', 
+                           'Specialty', 'AdmissionTimeOfDay', 'AdmissionDayOfWeek', 
+                           'OutOfHoursAdmission', 'PriorHospitalisation', 
+                           'diabetes', 'dialysis', 'palliative', 'immunosuppression', 
+                           'SupplementaryOxygen', 'AVPU', 
+                           'CommunityOnset', 'PriorBacteraemiaEpisode', 'Polymicrobial', 
+                           'ESBL', 'Ecoli', 'OtherESCAPPM', 'NonEnterobacterales', 
+                           'Other', 'Enterobacter', 'Klebsiella',
+                           'urinary_source', 'chest_source', 'abdominal_source', 
+                           'other_source', 'surgical_source', 'Multi_source', 
+                           'PriorAmoxicillin', 'PriorCoamoxiclav', 
+                           'PriorAnyAntibiotic', 'PriorBetaLactam', 
+                           # 'InactiveBaseline', 'InactiveCoamoxiclav', 
+                           # 'ActiveAminoglycoside', 'ActiveOther', 
+                           # 'ActiveCoamoxiclav', 'ActiveNonCoamox',
+                           'GivenBaselineAminoglycoside', 'GivenMultiAntibioticBaseline', 
+                           # 'ActivePreCultureAntibiotics', 'ActivePreCultureAminoglycoside', 
+                           'GivenTrimethoOrNitro'
+                           )
+
+continuous_variables <- c('AgeAtAdmission', 'PriorAdmissionsTotalDuration', 
+                          'IMDPercentile', 'Charlson_sum', 'Elixhauser_sum', 
+                          'Height', 'BMI', 
+                          'SBP', 'DBP', 'HeartRate', 'RespiratoryRate', 
+                          'OxygenSaturation', 'Temperature', 
+                          'albumin', 'alkaline_phosphatase', 'alt', 'aptt', 'ast', 
+                          'bilirubin', 'calcium_adjusted', 'creatinine', 'egfr', 
+                          'eosinophils', 'haematocrit', 'haemoglobin', 
+                          'immature_granulocytes', 'lymphocytes', 'magnesium', 
+                          'mch', 'mcv', 'monocytes', 'neutrophils', 'phosphate', 
+                          'platelets', 'potassium', 'pt', 'sodium', 'urea', 
+                          'white_cells', 'crp'
+                          )
+
+# remove highly correlated (|R|>0.8) variables
+to_remove <- c('NonEnterobacterales', 'Other', 'Enterobacter', 'Klebsiella', 
+               'OtherESCAPPM', 'Polymicrobial', 'OutOfHoursAdmission', 
+               'Multi_source', 'AdmissionTimeOfDay',
+               'haematocrit', 'mch', 'egfr', 'white_cells')
+categorical_variables <- categorical_variables[categorical_variables %notin% to_remove]
+continuous_variables <- continuous_variables[continuous_variables %notin% to_remove]
+
+# all predictor variables
+predictor_variables <- c(categorical_variables, continuous_variables)
+
+outcome_variables <- c('OverallSurvival_days_adjusted', 'OverallSurvival_days_capped', 
+                       'CensorStatus_day30', 'CensorStatus_day365', 'LengthOfStayFromCulture')
+
+cluster_variables <- c(predictor_variables, outcome_variables)
+```
+
+```{r}
+### ***EDIT*** load csv of unscaled, winsorised dataframe (all cases, not just complete ones) from user's local directory
+### this should be the same csv used for Enterobacterales baseline modelling
+# unfiltered_cluster_df <- read_csv("#####/#####.csv", 
+#                                   guess_max = 1e6)
+
+unfiltered_incomplete_cluster_df <- unfiltered_cluster_df[, cluster_variables]
+
+# create new unique ID
+unfiltered_incomplete_cluster_df <- unfiltered_incomplete_cluster_df %>%
+  rowid_to_column(., 'id')
+
+entero_cluster_df <- entero_cluster_df %>%
+  rowid_to_column(., 'id')
+
+# scale survival df
+scaled_incomplete_cluster_df <- unfiltered_incomplete_cluster_df %>%
+  mutate(across(c(AgeAtAdmission, alt, bilirubin, haemoglobin, mcv, SBP, DBP, 
+                  HeartRate, RespiratoryRate), ~ ./10 )) %>%
+  mutate(across(c(alkaline_phosphatase, creatinine), ~ . /100)) 
+
+head(scaled_incomplete_cluster_df,5)
+```
+
+
+Create clustering dataframe
+- complete cases only 
+- one-hot encoding / dummy variables for categorical variables
+- Yeo-Johnson transformation for continuous variables
+```{r}
+# complete cases only
+cluster_df <- scaled_incomplete_cluster_df[, c('id', cluster_variables)]
+complete_cluster_df <- cluster_df[complete.cases(cluster_df),]
+complete_ids = complete_cluster_df %>% .$id
+complete_cluster_df <- complete_cluster_df %>% select(-id)
+
+# one-hot encode all categorical using fastDummies
+one_hot_cluster_df <- dummy_cols(complete_cluster_df, 
+                                 select_columns = c(categorical_variables), 
+                                 remove_first_dummy = TRUE, 
+                                 remove_selected_columns = TRUE)
+
+# yeo_johnson transform continuous variables
+all_dims_transformed_df <- yeo_transform(one_hot_cluster_df, 
+                                         continuous_variables[continuous_variables %in% cluster_variables])
+
+summary(all_dims_transformed_df)
+```
+
+
+###Optimal number of k for k-means
+```{r}
+nb <- NbClust(all_dims_transformed_df,
+              distance = "euclidean",
+              method = "kmeans",
+              min.nc=2, max.nc=10,
+              index = "all")
+
+hist(nb$Best.nc[1,], 
+     breaks = max(na.omit(nb$Best.nc[1,])),
+     main = "majority method of optimal k for k-means",
+     xlab = 'k',
+     fill = NULL)
+
+# prettify histogram
+opt_k = tibble('method' = names(nb$Best.nc[1,]),
+               'k' = unname(nb$Best.nc[1,]))
+
+opt_k %>%
+  filter(k>0) %>%
+  ggplot(aes(k)) + 
+  geom_histogram(binwidth=1, fill='steelblue') +
+  labs(title = 'majority method of optimal k for k-means', xlab = 'k') +
+  scale_x_continuous(breaks = seq(0, 6, 1)) +
+  theme_minimal()
+```
+
+Alternative: optimal number of k for k-means by CONSENSUS CLUSTERING
+```{r}
+values_only <- data.matrix(all_dims_transformed_df)
+colnames(values_only) <- NULL
+values_only
+
+consensus_clusters = ConsensusClusterPlus(values_only,
+                                          maxK=10, # max k clusters
+                                          reps=1000, # number of sub-samples
+                                          pItem=1, # 100% item resampling = columns = variables
+                                          pFeature=0.8, # 100% of features to sample = rows = patients
+                                          title="hard k-means",
+                                          distance="euclidean",
+                                          plot = "pdf",   # save plots as PDF
+                                          clusterAlg="km"
+                                          
+                                          )
+
+consensus_clusters
+
+print('done') # to clear verbose output
+```
+
+
+###FCM clustering, k=3
+```{r}
+set.seed(100)
+custom_colors <- c("#F8766D", "#7DAE01", "#00BFC4")
+names(custom_colors) <- c("1", "2", "3")
+
+res.fcm.k3 <- fcm(all_dims_transformed_df, m=1.1, centers=3, nstart=10, fixcent = TRUE, numseed=100)
+res.fcm.k3
+
+summary(res.fcm.k3)
+
+# plot clusters
+res.fcm.k3.plot <- ppclust2(res.fcm.k3, "kmeans")
+
+factoextra::fviz_cluster(res.fcm.k3.plot, data = all_dims_transformed_df, 
+  ellipse.type = "convex",
+  geom="point",
+  # palette = "jco",
+  repel = TRUE) + scale_color_manual(values = custom_colors) + labs(title = 'soft k-means') + theme_minimal()
+
+```
+
+
+```{r}
+# update data with clusters
+soft_clusters <- as.data.frame(res.fcm.k3$u) %>%
+  rename('cluster_1' = 'Cluster 1',
+         'cluster_2' = 'Cluster 2',
+         'cluster_3' = 'Cluster 3')
+
+new_cox_df <- scaled_incomplete_cluster_df[, c('InactiveBaseline', cluster_variables, outcome_variables)]
+new_cox_df <- new_cox_df[complete.cases(new_cox_df),]
+
+# add cluster assignments and probabilities to scaled dataframe
+soft_complete_cluster_df <- new_cox_df %>%
+  cbind(soft_clusters) %>%
+  mutate(cluster_probability = pmax(cluster_1, cluster_2, cluster_3)) %>%   # take max probability as the cluster
+  mutate(cluster = case_when(cluster_probability == cluster_1 ~ '1',
+                             cluster_probability == cluster_2 ~ '2',
+                             cluster_probability == cluster_3 ~ '3')) %>%
+  mutate(cluster = factor(cluster, levels = c('1', '2', '3')))
+
+# plot cluster probabilities by cluster
+custom_colors_pastel <- c("#F4CCCC", "#d9ead3", "#d0e0e3")
+names(custom_colors_pastel) <- c("1", "2", "3")
+
+soft_complete_cluster_df %>%
+  ggplot(aes(x=cluster, y=cluster_probability, fill=cluster)) +
+  geom_boxplot(show.legend=FALSE) +
+  geom_jitter(size = 0.4, alpha=0.5, show.legend=FALSE) +
+  scale_fill_manual(values = custom_colors_pastel) +
+  scale_y_continuous(breaks=seq(0.2, 1.0, 0.1)) + 
+  labs(title = 'soft k-means: \ndistribution of cluster assignment probability by cluster', x='cluster', y='cluster probability') +
+  theme_minimal()
+```
+
+
+Plot differences between the clusters
+```{r}
+compare_clusters_df.k3 <- soft_complete_cluster_df %>%
+  select(cluster, cluster_probability) %>%
+  cbind(cluster_eda) %>% select(cluster_variables)
+
+# one-hot encode all categorical using fastDummies
+one_hot_compare_clusters.k3 <- dummy_cols(compare_clusters_df.k3, select_columns = c(categorical_variables), remove_first_dummy = FALSE, remove_selected_columns = TRUE)
+
+# yeo_johnson transform continuous variables
+compare_clusters_df_transformed.k3 <- yeo_transform(one_hot_compare_clusters.k3, continuous_variables[continuous_variables %in% model_variables])
+
+summary(compare_clusters_df_transformed.k3)
+```
+
+- compare differences for continuous variables
+```{r}
+cluster_plot_df.k3 <- compare_clusters_df_transformed.k3
+cluster_plot_df.k3$cluster <- soft_complete_cluster_df$cluster
+
+# hard-code variable order for plot (to maximise clarity)
+variate_order = c('Age', 'Neutrophils', 'Monocytes', 'Immature granulocytes', 
+                  'Platelets', 'Urea', 'Creatinine','Potassium', 'CRP', 
+                  'Lymphocytes', 'Haemoglobin', 'MCH', 'MCV', 'Eosinophils',  
+                  'IMD percentile', 'Respiratory rate', 'Oxygen saturation', 
+                  'Heart rate', 'Charlson', 'Elixhauser', 
+                  'Prior admissions total days',  'Alkaline phosphatase', 
+                  'Sodium', 'BMI', 'Weight', 'ALT', 'Bilirubin',  'SBP', 'DBP', 
+                  'Temperature', 'Albumin')
+
+# compute differences in continuous variables
+hard_cont_plots.k3 <- compare_continuous_clusters(standardised_df =  cluster_plot_df.k3, 
+                                              continuous_var = c(continuous_variables), 
+                                              type = 'hard k-means', 
+                                              n_clusters = 3, 
+                                              variate_order = variate_order)
+
+# plot comparisons between clusters for continuous variable medians
+hard_cont_plots.k3[[5]] %>%
+  mutate(variate = str_to_title(variate)) %>% 
+  mutate(variate = case_when(variate == 'Sbp' ~ 'SBP',
+                             variate == 'Dbp' ~ 'DBP',
+                             variate == 'Alt' ~ 'ALT',
+                             variate == 'Bmi' ~ 'BMI',
+                             variate == 'Heartrate' ~ 'Heart rate',
+                             variate == 'Mcv' ~ 'MCV',
+                             variate == 'Oxygensaturation' ~ 'Oxygen saturation',
+                             variate == 'Respiratoryrate' ~ 'Respiratory rate',
+                             variate == 'Imdpercentile' ~ 'IMD percentile',
+                             variate == 'Alkaline_phosphatase' ~ 'Alkaline phosphatase',
+                             variate == 'Ageatadmission' ~ 'Age',
+                             variate == 'Prioradmissionstotalduration' ~ 'Prior admissions total days',
+                             variate == 'Charlson_sum' ~ 'Charlson',
+                             variate == 'Elixhauser_sum' ~ 'Elixhauser',
+                             variate == 'Crp' ~ 'CRP',
+                             variate == 'Immature_granulocytes' ~ 'Immature granulocytes',
+                             TRUE ~ variate)) %>%
+  ggplot(mapping = aes(x=variate, y=diff, group=cluster, color=cluster)) +
+      geom_line() +
+      geom_hline(yintercept = 0, linetype='dashed') +
+      aes(x=factor(variate, levels=variate_order)) +
+      labs(title = paste0('Enterobacterales k=3: differences of median'),
+           x = 'Variate',
+           y = 'Difference between standardised cluster median and overall median') +
+      theme(panel.background = element_blank(), 
+            panel.grid.major = element_line(colour = "grey95"), 
+            axis.text.x = element_text(angle = 45, vjust=1, hjust=1))
+```
+
+- compare differences for categorical variables
+```{r}
+# manual ordering for maximal clarity
+cat_variate_order = c('Prior hospitalisation',  "Specialty: medical subspecialty",   
+                      'Diabetes',  'Sex: male', "Respiratory source", 
+                      "Other source", "Surgical source" , 'Supplementary oxygen',  
+                      'Immunosuppression', 'ESBL',  "Specialty: other", 'Dialysis',
+                      "Admitted Monday", "Admitted Tuesday", "Admitted Wednesday", 
+                      "Admitted Thursday", "Admitted Friday", "Admitted Saturday", 
+                      "Admitted Sunday", 'Ethnicity: unrecorded', 'Palliative', 
+                      'AVPU: pain / unresponsive', 'AVPU: verbal',  'AVPU: alert',    
+                      "Abdominal source", "Specialty: Acute general surgery", 
+                      'E. coli',   'Community onset', 'Ethnicity: white', 
+                      "Specialty: Acute general medicine",  'Urinary source')
+
+cat_comp.k3.sans_prior_abx <- compare_categorical_clusters(cluster_plot_df.k3, 
+                                            c(continuous_variables, 'Height', 
+                                              "PriorAnyAntibiotic_1",  "PriorCoamoxiclav_1", 
+                                              'PriorBetaLactam_1', "PriorAmoxicillin_1"), 
+                                            type_clustering = 'hard k-means', 
+                                            n_clusters = 3, 
+                                            variate_order = cat_variate_order)
+
+cat_comp.k3.sans_prior_abx[[2]] %>%
+  mutate(variate = as.character(variate)) %>%
+  mutate(variate = case_when(variate == 'PriorHospitalisation_1' ~ 'Prior hospitalisation',
+                             variate == 'Specialty_Medical subspecialty' ~ 'Specialty: medical subspecialty',
+                             variate == 'diabetes_1' ~ 'Diabetes',
+                             variate == 'LinkedSex_M' ~ 'Sex: male',
+                             variate == 'chest_source_1' ~ 'Respiratory source',
+                             variate == 'other_source_1' ~ 'Other source',
+                             variate == 'surgical_source_1' ~ 'Surgical source',
+                             variate == 'immunosuppression_1' ~ 'Immunosuppression',
+                             variate == 'ESBL_1' ~ 'ESBL',
+                             variate == 'Specialty_Other' ~ 'Specialty: other',
+                             variate == 'dialysis_1' ~ 'Dialysis',
+                             variate == 'SupplementaryOxygen_1' ~ 'Supplementary oxygen',
+                             variate == 'AdmissionDayOfWeek_Monday' ~ 'Admitted Monday',
+                             variate == 'AdmissionDayOfWeek_Tuesday' ~ 'Admitted Tuesday',
+                             variate == 'AdmissionDayOfWeek_Wednesday' ~ 'Admitted Wednesday',
+                             variate == 'AdmissionDayOfWeek_Thursday' ~ 'Admitted Thursday',
+                             variate == 'AdmissionDayOfWeek_Friday' ~ 'Admitted Friday',
+                             variate == 'AdmissionDayOfWeek_Saturday' ~ 'Admitted Saturday',
+                             variate == 'AdmissionDayOfWeek_Sunday' ~ 'Admitted Sunday',
+                             variate == 'Ethnicity_unrecorded' ~ 'Ethnicity: unrecorded',
+                             variate == 'palliative_1' ~ 'Palliative',
+                             variate == 'AVPU_Pain / Unresponsive' ~ 'AVPU: pain / unresponsive',
+                             variate == 'AVPU_Verbal' ~ 'AVPU: verbal',
+                             variate == 'AVPU_Alert' ~ 'AVPU: alert',
+                             variate == 'abdominal_source_1' ~ 'Abdominal source',
+                             variate == 'Specialty_Acute and general surgery' ~ 'Specialty: Acute general surgery',
+                             variate == 'Ecoli_1' ~ 'E. coli',
+                             variate == 'CommunityOnset_1' ~ 'Community onset',
+                             variate == 'Ethnicity_white' ~ 'Ethnicity: white',
+                             variate == 'Specialty_Acute and general medicine' ~ 'Specialty: Acute general medicine',
+                             variate == 'urinary_source_1' ~ 'Urinary source',
+                             TRUE ~ variate)) %>%
+  filter(variate %in% cat_variate_order_sans_prior_abx) %>%
+  ggplot(mapping = aes(x=variate, y=diff, group=cluster, color=cluster)) + 
+      geom_line() +
+      aes(x=factor(variate, levels = cat_variate_order_sans_prior_abx)) +
+      labs(title = paste0('Enterobacterales k=3: differences of cluster proportions'), 
+           x = 'Variate',
+           y = 'Difference of cluster proportions to overall proportions') + 
+      theme(panel.background = element_blank(), 
+            panel.grid.major = element_line(colour = "grey95"), 
+            axis.text.x = element_text(angle = 60, vjust=1, hjust=1))
+```
+
+
+###Word clouds of clusters
+```{r}
+# to remove prior antibiotoic exposure
+prior_abx_vars = c('PriorAnyAntibiotic', 'PriorCoamoxiclav', 'PriorBetaLactam', 
+                   'PriorAmoxicillin', 'InactiveBaseline', 'GivenTrimethoOrNitro', 
+                   'ActiveOther', 'ActiveAminoglycoside')
+```
+
+Prepare dataframe for word clouds
+```{r}
+# create df suitable for word clouds
+# one-hot encode all categorical using fastDummies
+cloud_one_hot.k3 <- dummy_cols(compare_clusters_df.k3, 
+                               select_columns = c(categorical_variables), 
+                               remove_first_dummy = TRUE, 
+                               remove_selected_columns = TRUE)
+
+# remove outcome and id variables
+cloud_clusters_pre_transform.k3 <- cloud_one_hot.k3[, -which(names(cloud_one_hot.k3) %in% c(outcome_variables, "ClusterID", "NewCulturePeriodNumber"))]
+
+# yeo_johnson transform continuous variables
+cloud_clusters_df_transformed.k3 <- yeo_transform(cloud_clusters_pre_transform.k3, continuous_variables[continuous_variables %in% model_variables])
+
+cloud_cluster_df.k3 <- cloud_clusters_df_transformed.k3 %>%
+# add hospital onset - inverse of community onset
+  mutate(HospitalOnset = case_when(CommunityOnset_1 == 1 ~ 0,
+                                   CommunityOnset_1 == 0 ~ 1))
+
+# add cluster assignment from FCM above
+cloud_cluster_df.k3$cluster <- soft_complete_cluster_df$cluster
+
+# reconfigure columns to allow word clouds (by frequency / magnitude)
+cloud_cat.k3 = prep_categorical_wordcloud(cloud_cluster_df.k3,
+                                       cont_vars = c(continuous_variables, 'Height'),
+                                       n_clusters = 3)
+
+head(cloud_cat.k3, 5)
+```
+
+Plot word clouds
+```{r, fig.height=10, fig.width=10}
+set.seed(100)
+
+plot_wordcloud(hard_cont_plots.k3[[5]], cloud_cat.k3,
+               select_cluster = 1,
+               remove = prior_abx_vars)
+
+plot_wordcloud(hard_cont_plots.k3[[5]], cloud_cat.k3,
+               select_cluster = 2,
+               remove = prior_abx_vars)
+
+plot_wordcloud(hard_cont_plots.k3[[5]], cloud_cat.k3,
+               select_cluster = 3,
+               remove = prior_abx_vars)
+```
+
+
+
+###FCM clustering, k=4
+Run FCM algorithm
+```{r}
+set.seed(100)
+custom_colors <- c("#F8766D", "#7DAE01", "#00BFC4", "#DB6AFE")
+names(custom_colors) <- c("1", "2", "3", "4")
+
+res.fcm.k4 <- fcm(all_dims_transformed_df, 
+                  m=1.1, 
+                  centers=4, 
+                  nstart=10, 
+                  fixcent = TRUE, 
+                  numseed=100)
+
+summary(res.fcm.k4)
+
+# plot clusters
+res.fcm.k4.plot <- ppclust2(res.fcm.k4, "kmeans")
+
+factoextra::fviz_cluster(res.fcm.k4.plot, 
+                         data = all_dims_transformed_df, 
+                         ellipse.type = "convex",
+                         geom='point',
+                         # palette = "jco",
+                         repel = FALSE) + 
+  scale_color_manual(values = custom_colors) + 
+  labs(title = 'soft k-means') + 
+  theme_minimal()
+
+```
+
+Save cluster assignments and probabilities
+```{r}
+# update data with clusters
+soft_clusters.k4 <- as.data.frame(res.fcm.k4$u) %>%
+  rename('cluster_1' = 'Cluster 1',
+         'cluster_2' = 'Cluster 2',
+         'cluster_3' = 'Cluster 3',
+         'cluster_4' = 'Cluster 4')
+
+new_cox_df.k4 <- scaled_incomplete_cluster_df[, c('InactiveBaseline', cluster_variables, outcome_variables)]
+new_cox_df.k4 <- new_cox_df.k4[complete.cases(new_cox_df.k4),]
+
+soft_complete_cluster_df.k4 <- new_cox_df.k4 %>%
+  cbind(soft_clusters.k4) %>%
+  mutate(cluster_probability = pmax(cluster_1, cluster_2, cluster_3, cluster_4)) %>%   # take max probability as the cluster
+  mutate(cluster = case_when(cluster_probability == cluster_1 ~ '1',
+                             cluster_probability == cluster_2 ~ '2',
+                             cluster_probability == cluster_3 ~ '3',
+                             cluster_probability == cluster_4 ~ '4')) %>%
+  # match groups to k=3 assignments
+  mutate(cluster = case_when(cluster == '2' ~ '4',
+                             cluster == '4' ~ '3',
+                             cluster == '3' ~ '2',
+                             TRUE ~ cluster)) %>%
+  mutate(cluster = factor(cluster, levels = c('1', '2', '3', '4')))
+
+# add unique id and save assignments
+# soft_complete_cluster_df.k4$id = 1:nrow(soft_complete_cluster_df.k4)
+# to_save = soft_complete_cluster_df.k4 %>% select(id, cluster, cluster_probability, cluster_1, cluster_2, cluster_3, cluster_4)
+# 
+# write_csv(to_save, 'entero_k4_clusters.csv')
+```
+
+Plot cluster probabilities
+```{r}
+custom_colors_pastel <- c("#F4CCCC", "#d9ead3", "#d0e0e3", "#EBC3FF")
+names(custom_colors_pastel) <- c("1", "2", "3", "4")
+
+soft_complete_cluster_df.k4 %>%
+  ggplot(aes(x=cluster, y=cluster_probability, fill=cluster)) +
+  geom_boxplot(show.legend=FALSE) +
+  geom_jitter(size = 0.4, alpha=0.5, show.legend=FALSE) +
+  scale_fill_manual(values = custom_colors_pastel) +
+  scale_y_continuous(breaks=seq(0.4, 1.0, 0.1)) + 
+  labs(title = 'soft k-means: \ndistribution of cluster assignment probability by cluster', x='cluster', y='cluster probability') +
+  theme_minimal()
+```
+

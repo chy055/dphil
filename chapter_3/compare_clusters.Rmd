@@ -1,0 +1,289 @@
+---
+title: "compare_clusters"
+author: "Chang Ho Yoon"
+date: "13/01/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# load dependencies
+library(cvms)
+library(tidyverse)
+```
+
+
+*load data*
+```{r}
+### each will need 
+# Seymour-29, k-means k = 4
+seymour_29_df = read_csv('seymour_vars_km_4.csv', guess_max=1e6)
+
+# Seymour-21: Seymour-29 minus highly missing i.e. Seymour-21, k-means k=4 
+seymour_21_df = read_csv('seymour_minus_missing_km_4.csv', guess_max=1e6)
+
+# Seymour-29 complete cases only
+seymour_29_complete_df = read_csv('seymour_complete.csv', guess_max=1e6)
+
+# Seymour-71: Seymour=29 plus all IORD variables
+seymour_71_df = read_csv('seymour_plus_km_4.csv', guess_max=1e6)
+
+# Seymour-61: Seymour-29 plus IORD variables minus highly-correlated
+seymour_61_df = read_csv('seymour_plus_minus_km_4.csv', guess_max=1e6)
+
+# Seymour-29 + continuous only: 
+seymour_61_plus_cont_df = read_csv('seymour_plus_minus_cont_km_4.csv', guess_max = 1e6)
+
+# Seymour-61 with both k-means k=4 and k-means k=5 clusters
+seymour_61_km4_5_df = read_csv('seymour_plus_minus_km_4_and_5.csv', guess_max = 1e6)
+
+### External Seymour model ASSIGNMENT OF PHENOTYPES
+ext_phenotypes_df = read_csv('seymour_to_iord_both_assigned.csv', guess_max = 1e6) 
+  # %>% select(-`...1`)
+```
+
+*seymour-29 vs. seymour-21 (seymour minus missing)*
+i.e., >15% missing = bicarbonate, chloride, lactate, troponin, glucose, esr, ast, po2
+and RF imputation of the rest
+```{r}
+cat(paste0('number of variables in Seymour only: ', length(colnames(seymour_29_df))-1))
+cat(paste0('\nnumber of variables in Seymour minus highly missing: ', length(colnames(seymour_21_df))-1))
+
+# confusion matrix
+confusion = seymour_29_df %>% select(cluster)
+
+confusion$plus <- seymour_21_df$cluster
+
+cm <- as.data.frame(table(confusion$cluster, confusion$plus))
+
+cm <- cm %>% rename('Seymour_only' = 'Var1', 'Seymour_minus_missing' = 'Var2')
+
+
+plot_confusion_matrix(cm, 
+                      target_col = "Seymour_only", 
+                      prediction_col = "Seymour_minus_missing",
+                      counts_col = "Freq",
+                      add_normalized = FALSE,
+                      add_counts = TRUE,
+                      add_col_percentages = TRUE,
+                      add_row_percentages = TRUE,
+                      place_x_axis_above = FALSE) +
+  labs(title = 'confusion plot: Seymour variables only vs. Seymour minus highly missing', x = 'Seymour 29 variables', y = 'Seymour minus highly missing')
+```
+
+
+*seymour-29 vs. seymour-21 complete cases only*
+i.e., >15% missing = bicarbonate, chloride, lactate, troponin, glucose, esr, ast, po2
+removed
+```{r}
+complete_ids = seymour_29_complete_df %>% .$id
+
+cat(paste0('number of variables in Seymour only: ', length(colnames(seymour_29_df))-1))
+cat(paste0('\nnumber of variables in Seymour complete cases: ', length(colnames(seymour_29_complete_df))-1))
+
+# confusion matrix
+confusion = seymour_29_df[complete_ids,]  %>% select(cluster)
+
+confusion$plus <- seymour_29_complete_df$cluster
+
+cm <- as.data.frame(table(confusion$cluster, confusion$plus))
+
+cm <- cm %>% rename('Complete' = 'Var1', 'Imputed' = 'Var2')
+
+plot_confusion_matrix(cm, 
+                      target_col = "Imputed", 
+                      prediction_col = "Complete",
+                      counts_col = "Freq",
+                      add_normalized = FALSE,
+                      add_counts = TRUE,
+                      add_col_percentages = TRUE,
+                      add_row_percentages = TRUE,
+                      place_x_axis_above = FALSE) +
+  labs(title = 'confusion plot: Seymour imputed vs. Seymour complete', x = 'Seymour with imputation', y = 'Seymour complete cases')
+```
+
+
+*seymour-29 vs. seymour-71*
+```{r}
+cat(paste0('number of variables in Seymour only: ', length(colnames(seymour_29_df))-1))
+cat(paste0('\nnumber of variables, incl. one-hot-encoded, in Seymour plus: ', length(colnames(seymour_71_df))-1))
+
+# confusion matrix
+confusion = seymour_29_df %>% select(cluster)
+
+confusion$plus <- seymour_71_df$cluster
+
+cm <- as.data.frame(table(confusion$cluster, confusion$plus))
+
+cm <- cm %>% rename('Seymour_only' = 'Var1', 'Seymour_plus' = 'Var2')
+
+
+plot_confusion_matrix(cm, 
+                      target_col = "Seymour_only", 
+                      prediction_col = "Seymour_plus",
+                      counts_col = "Freq",
+                      add_normalized = FALSE,
+                      add_counts = TRUE,
+                      add_col_percentages = TRUE,
+                      add_row_percentages = TRUE,
+                      place_x_axis_above = FALSE) +
+  labs(title = 'confusion plot: Seymour variables only vs. Seymour plus', x = 'Seymour 29 variables', y = 'Seymour plus all IORD variables')
+
+```
+
+
+*seymour-29 vs. seymour-61*
+```{r}
+cat(paste0('number of variables in Seymour only: ', length(colnames(seymour_29_df))-1))
+cat(paste0('\nnumber of variables, incl. one-hot-encoded, in Seymour plus minus: ', length(colnames(seymour_61_df))-1))
+
+# confusion matrix
+confusion = seymour_29_df %>% select(cluster)
+
+confusion$plus <- seymour_61_df$cluster
+
+cm <- as.data.frame(table(confusion$cluster, confusion$plus))
+
+cm <- cm %>% rename('Seymour_only' = 'Var1', 'Seymour_plus_minus' = 'Var2')
+
+
+plot_confusion_matrix(cm, 
+                      target_col = "Seymour_only", 
+                      prediction_col = "Seymour_plus_minus",
+                      counts_col = "Freq",
+                      add_normalized = FALSE,
+                      add_counts = TRUE,
+                      add_col_percentages = TRUE,
+                      add_row_percentages = TRUE,
+                      place_x_axis_above = FALSE) +
+  labs(title = 'confusion plot: Seymour variables only vs. Seymour plus minus highly-correlated', x = 'Seymour 29 variables', y = 'Seymour plus all IORD variables excl. highly-correlated')
+
+cat(paste('rand index:', rand.index(confusion$cluster, confusion$plus)))
+cat(paste('\nadjusted rand index:', adj.rand.index(confusion$cluster, confusion$plus)))
+```
+
+
+*seymour-71 vs. seymour-61*
+```{r}
+cat(paste0('\nnumber of variables, incl. one-hot-encoded, in Seymour plus: ', length(colnames(seymour_71_df))-1))
+cat(paste0('\nnumber of variables, incl. one-hot-encoded, in Seymour plus minus: ', length(colnames(seymour_61_df))-1))
+
+# confusion matrix
+confusion = seymour_71_df %>% select(cluster)
+
+confusion$plus <- seymour_61_df$cluster
+
+cm <- as.data.frame(table(confusion$cluster, confusion$plus))
+
+cm <- cm %>% rename('Seymour_plus' = 'Var1', 'Seymour_plus_minus' = 'Var2')
+
+
+plot_confusion_matrix(cm, 
+                      target_col = "Seymour_plus", 
+                      prediction_col = "Seymour_plus_minus",
+                      counts_col = "Freq",
+                      add_normalized = FALSE,
+                      add_counts = TRUE,
+                      add_col_percentages = TRUE,
+                      add_row_percentages = TRUE,
+                      place_x_axis_above = FALSE) +
+  labs(title = 'confusion plot:\nSeymour plus vs. Seymour plus minus highly-correlated', x = 'Seymour plus', y = 'Seymour plus minus')
+
+```
+
+
+*seymour-61 k = 4 vs. k = 5 (CDF delta plot suggests k = 5 may be optimal)*
+```{r}
+cat(paste0('\nnumber of variables, incl. one-hot-encoded, in Seymour plus minus km=5: ', length(colnames(seymour_61_km4_5_df))-1))
+
+# confusion matrix
+confusion = seymour_61_km4_5_df %>% select(cluster)
+
+confusion$plus <- seymour_61_km4_5_df$cluster_k5
+
+cm <- as.data.frame(table(confusion$cluster, confusion$plus))
+
+cm <- cm %>% rename('Seymour_plus_minus_k_4' = 'Var1', 'Seymour_plus_minus_k_5' = 'Var2')
+
+ggplot(cm, aes(Seymour_plus_minus_k_4, Seymour_plus_minus_k_5)) +                        
+  geom_tile(aes(fill = Freq)) +
+  scale_fill_gradient(low = "#FFFFFF",
+                      high = "#012345") +
+  labs(x = 'all IORD variables excl. highly-correlated, k=4', y = 'all IORD variables excl. highly-correlated, k=5')
+
+
+# plot_confusion_matrix(cm, 
+#                       target_col = "Seymour_plus_minus_k_4", 
+#                       prediction_col = "Seymour_plus_minus_k_6",
+#                       counts_col = "Freq",
+#                       add_normalized = FALSE,
+#                       add_counts = TRUE,
+#                       add_col_percentages = TRUE,
+#                       add_row_percentages = TRUE,
+#                       place_x_axis_above = FALSE) +
+#   labs(title = 'confusion plot:\nSeymour plus minus k=4 vs. Seymour plus minus k=6', x = 'k=4', y = 'k=6')
+```
+
+
+
+*seymour-29 plus continuous variables only k = 4 (Consensus optimal)*
+```{r}
+cat(paste0('number of variables in Seymour only: ', length(colnames(seymour_29_df))-1))
+cat(paste0('\nnumber of variables, incl. one-hot-encoded, in Seymour plus minus continuous only: ', length(colnames(seymour_61_plus_cont_df))-1))
+
+# confusion matrix
+confusion = seymour_29_df %>% select(cluster)
+
+confusion$plus <- seymour_61_plus_cont_df$cluster
+
+cm <- as.data.frame(table(confusion$cluster, confusion$plus))
+
+cm <- cm %>% rename('Seymour_only' = 'Var1', 'Seymour_plus_minus_continuous' = 'Var2')
+
+
+plot_confusion_matrix(cm, 
+                      target_col = "Seymour_only", 
+                      prediction_col = "Seymour_plus_minus_continuous",
+                      counts_col = "Freq",
+                      add_normalized = FALSE,
+                      add_counts = TRUE,
+                      add_col_percentages = TRUE,
+                      add_row_percentages = TRUE,
+                      place_x_axis_above = FALSE) +
+  labs(title = 'confusion plot:\nSeymour only vs. Seymour plus minus continuous', x = 'Seymour 29 variables', y = 'Seymour plus continuous variables in IORD')
+
+```
+
+
+
+###EXTERNAL SEYMOUR ET AL. MODEL APPLIES TO IORD DATA
+*Seymour code-assigned clusters vs. IORD consensus clusters*
+```{r}
+ext_phenotypes_df
+
+# confusion matrix
+confusion = ext_phenotypes_df %>% select(cluster)
+
+confusion$iord <- ext_phenotypes_df$iord_cluster
+
+cm <- as.data.frame(table(confusion$cluster, confusion$iord))
+
+cm <- cm %>% rename('Seymour' = 'Var1', 'IORD' = 'Var2')
+
+
+plot_confusion_matrix(cm, 
+                      target_col = "Seymour", 
+                      prediction_col = "IORD",
+                      counts_col = "Freq",
+                      add_normalized = FALSE,
+                      add_counts = TRUE,
+                      # intensity_by = "normalized",
+                      add_col_percentages = TRUE,
+                      add_row_percentages = TRUE,
+                      place_x_axis_above = FALSE) +
+  labs(title = 'Figure 2: confusion plot of\n               internal phenotypes vs.\n               external model phenotypes', x = 'SENECA-derived clusters', y = 'Internal IORD clusters') +
+  scale_x_discrete(labels= c('alpha', 'beta', 'gamma', 'delta'))
+
+cat(paste('rand index:', rand.index(ext_phenotypes_df$cluster, ext_phenotypes_df$iord_cluster)))
+cat(paste('\nadjusted rand index:', adj.rand.index(ext_phenotypes_df$cluster, ext_phenotypes_df$iord_cluster)))
+```
+
