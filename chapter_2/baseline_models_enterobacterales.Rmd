@@ -1,0 +1,321 @@
+---
+title: "baseline_models_enterobacterales"
+author: "Chang Ho Yoon"
+date: "12/01/2024"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+# load dependencies
+library(tidyverse)
+library(assertr)
+library(glue)
+library(car)
+library(gtsummary)
+
+library(survival)
+library(survminer)
+library(mfp)
+library(MASS)
+library(ggeffects)
+library(fastDummies)
+
+# create additional custom commands
+`%notin%` <- Negate(`%in%`)
+`%notwithin%` <- Negate(`%within%`)
+`%+%` <- ggplot2::`%+%`
+
+# import functions
+source("utils/entero_bsi_modelling_utils.R")
+```
+
+
+*import data*
+```{r}
+### ALL VARIABLES
+categorical_variables <- c('LinkedSex', 'Ethnicity', 'Specialty', 
+                           'AdmissionTimeOfDay', 'AdmissionDayOfWeek', 
+                           'OutOfHoursAdmission', 'PriorHospitalisation', 
+                           'diabetes', 'dialysis', 'palliative', 'immunosuppression', 
+                           'SupplementaryOxygen', 'AVPU', 
+                           'CommunityOnset', 'PriorEcoliBacteraemiaEpisode', 
+                           'Polymicrobial', 
+                           'ESBL', 'Ecoli', 'OtherESCAPPM', 'NonEnterobacterales', 
+                           'Other', 'Enterobacter', 'Klebsiella',
+                           'urinary_source', 'chest_source', 'abdominal_source', 
+                           'other_source', 'surgical_source', 'Multi_source', 
+                           'PriorAmoxicillin', 'PriorCoamoxiclav', 
+                           'PriorAnyAntibiotic', 'PriorBetaLactam', 
+                           'InactiveCoamoxiclav', 'InactiveAminoglycoside', 
+                           'InactiveOther', 'ActiveAminoglycoside', 'ActiveOther', 
+                           'ActiveCoamoxiclav', 'ActiveNonCoamox',
+                           'GivenBaselineAminoglycoside', 'GivenMultiAntibioticBaseline', 
+                           'GivenTrimethoOrNitro', 
+                           'ActivePreCultureAntibiotics', 'ActivePreCultureAminoglycoside'
+                           )
+
+
+continuous_variables <- c('AgeAtAdmission', 'IMDPercentile',
+                          'PriorAdmissionsTotalDuration', 
+                          'Charlson_sum', 'Elixhauser_sum', 'Height', 'BMI', 
+                          'SBP', 'DBP', 'HeartRate', 'RespiratoryRate', 
+                          'OxygenSaturation', 'Temperature', 
+                          'albumin', 'alkaline_phosphatase', 'alt', 'aptt', 'ast', 
+                          'bilirubin', 'calcium_adjusted', 'creatinine', 'egfr', 
+                          'eosinophils', 'haematocrit', 'haemoglobin', 
+                          'immature_granulocytes', 'lymphocytes', 'magnesium', 
+                          'mch', 'mcv', 'monocytes', 'neutrophils', 'phosphate', 
+                          'platelets', 'potassium', 'pt', 'sodium', 'urea', 
+                          'white_cells'
+                          )
+
+# all predictor variables
+predictor_variables <- c(categorical_variables, continuous_variables)
+
+# all outcome variables
+outcome_variables <- c('OverallSurvival_days_adjusted', 'OverallSurvival_days_capped', 
+                       'CensorStatus_day30', 'CensorStatus_day365', 
+                       'LengthOfStayFromCulture')
+model_variables <- c(predictor_variables, outcome_variables)
+```
+
+```{r}
+### IMPORT DATA
+##### should be modified to read csv of cleaned data from user's directory
+# entero_pre_analysis_outcomes_df <- read_csv("/######/######.csv", 
+#                                             guess_max = 1e6)
+
+# factorise categorical variables and set references
+entero_pre_analysis_outcomes_df <- factorise_categorical(entero_pre_analysis_outcomes_df, 
+                                                        factorise_all = TRUE, 
+                                                        categorical_variables, 
+                                                        factorise_multilevel = TRUE)
+
+# make unfiltered dataframe
+unfiltered_survival_df <- make_survival_df(entero_pre_analysis_outcomes_df, 
+                                           winsorise_continuous = FALSE)
+
+unfiltered_survival_df
+```
+
+
+###Base effects model
+
+Remove highly correlated variables
+```{r}
+to_remove <- c('NonEnterobacterales', 'Other', 'Enterobacter', 'Klebsiella', 
+               'OtherESCAPPM', 'Polymicrobial', 'OutOfHoursAdmission', 
+               'Multi_source', 'AdmissionTimeOfDay',  'creatinine', 'Charlson_sum',
+               'haematocrit', 'mch', 'egfr', 'white_cells')
+
+predictor_variables <- predictor_variables[predictor_variables %notin% to_remove]
+categorical_variables <- categorical_variables[categorical_variables %notin% to_remove]
+continuous_variables <- continuous_variables[continuous_variables %notin% to_remove]
+
+model_variables <- c(predictor_variables, outcome_variables)
+```
+
+Winsorise/truncate, scaled and complete dataframes
+- scaled for ease of interpretability for selected variables
+```{r}
+### winsorise / truncate
+# symmetrical winsorisation: for continuous covariates with a natural limit
+sym_wins_vars <- c('BMI', 'Height', 'Weight', 'SBP', 'DBP', 'HeartRate', 
+                   'RespiratoryRate', 'Temperature', 
+                   'Charlson_sum', 'Elixhauser_sum', 
+                   'potassium', 'sodium', 'albumin', 'creatinine', 
+                   'haemoglobin', 'mcv')
+
+# asymmetrical winsorisation: for continuous covariates without a natural limit 
+asym_wins_upper_vars <- c('bilirubin', 'alkaline_phosphatase', 'alt', 'urea',
+                          'eosinophils', 'lymphocytes', 'immature_granulocytes', 
+                          'neutrophils', 'platelets', 'monocytes',
+                          'PriorAdmissionsTotalDuration')
+asym_wins_lower_vars <- c('OxygenSaturation')
+
+residual_cont_vars <- continuous_variables[continuous_variables %notin% c(sym_wins_vars, asym_wins_lower_vars, asym_wins_upper_vars)]
+
+cat('\n\ncovariates without winsorisation:', paste(residual_cont_vars, collapse = ' + '),'\n')
+
+winsorised_unfiltered_survival_df <- make_survival_df(entero_pre_analysis_outcomes_df, 
+                                                        winsorise_continuous = TRUE, 
+                                                        sym_wins_vars = sym_wins_vars, 
+                                                        sym_limits = c(0.025, 0.975), 
+                                                        
+                                                        asym_upper_vars = asym_wins_upper_vars, 
+                                                        asym_upper_limits = c(0, 0.95),
+                                                        
+                                                        asym_lower_vars = asym_wins_lower_vars, 
+                                                        asym_lower_limits = c(0.05, 1))
+
+winsorised_incomplete_survival_df <- winsorised_unfiltered_survival_df[, model_variables]
+
+
+### scale survival df
+scaled_winsorised_incomplete_survival_df <- winsorised_incomplete_survival_df %>%
+  mutate(Height = Height,
+         Weight = Weight,
+         SBP = SBP/10,
+         DBP = DBP/10,
+         HeartRate = HeartRate/10,
+         RespiratoryRate = RespiratoryRate/10,
+         OxygenSaturation = OxygenSaturation,
+         Temperature = Temperature,
+         albumin = albumin,
+         alkaline_phosphatase = alkaline_phosphatase/100,
+         alt = alt/10,
+         bilirubin = bilirubin/10,
+         creatinine = creatinine/10,
+         haemoglobin = haemoglobin/10,
+         mcv = mcv/10,
+         platelets = platelets/100,
+         potassium = potassium,
+         sodium = sodium,
+         urea = urea,
+         AgeAtAdmission = AgeAtAdmission/10,
+         )
+
+### complete data
+scaled_survival_df <- scaled_winsorised_incomplete_survival_df[complete.cases(scaled_winsorised_incomplete_survival_df), ]
+
+head(scaled_survival_df,5)
+```
+
+
+###Univariable estimate for inactive baseline
+```{r}
+univar_df <- scaled_winsorised_incomplete_survival_df[,c('InactiveBaseline', 'OverallSurvival_days_capped', 'CensorStatus_day30')]
+univar_df <- univar_df[complete.cases(univar_df),]
+nrow(univar_df)
+summary(categorical_univariate_fit('InactiveBaseline', survival_dataframe = univar_df))
+```
+
+
+###Multivariable Cox
+```{r}
+# choose variables for automatic scaling (i.e., variables that are not selected to be scaled in lines 156-177 above)
+# note that scaling does not affect variable selection nor HR estimates - it serves only to improve interpretability
+for_auto_scaling <- c('eosinophils', 'immature_granulocytes', 'monocytes', 
+                      'lymphocytes', 'neutrophils', 'PriorAdmissionsTotalDuration', 
+                      'Charlson_sum', 'Elixhauser_sum')
+for_auto_scaling <- for_auto_scaling[for_auto_scaling %in% continuous_variables]
+continuous_var_autoscaling <- paste0('fp(', for_auto_scaling,', df = 4, scale=TRUE)')
+
+# choose variables for no scaling:
+not_for_scaling <- continuous_variables[continuous_variables %notin% c(for_auto_scaling)]
+continuous_var_unscaled <- paste0('fp(', not_for_scaling,', df = 4, scale=FALSE)')
+
+# create formula
+if(identical(for_auto_scaling, character(0))){
+
+  multivar_mfp_formula <- as.formula(paste0('Surv(OverallSurvival_days_capped, CensorStatus_day30) ~ (',
+                                     paste(categorical_variables, collapse=" + "), ' + ',
+                                     paste(continuous_var_unscaled, collapse = " + "), ')'))
+}else{
+  
+  multivar_mfp_formula <- as.formula(paste0('Surv(OverallSurvival_days_capped, CensorStatus_day30) ~ (',
+                                     paste(categorical_variables, collapse=" + "), ' + ',
+                                     paste(continuous_var_unscaled, collapse = " + "), ' + ',
+                                     paste(continuous_var_autoscaling, collapse = " + "), ')'))
+}
+
+# fit provisional model
+mic.provisional <- mfp(multivar_mfp_formula, 
+                     family = cox,
+                     data = scaled_survival_df,
+                     select = 0.05,           #variate selection significance
+                     alpha = 0.05,            #fractional polynomial selection significance
+                     method = 'efron',
+                     keep = c("InactiveBaseline"),          #keep variable
+                     verbose = TRUE,
+                     maxits = 20)
+
+# see coefficients
+mic.provisional$fit %>%
+  tbl_regression(exponentiate = TRUE, conf.int = 0.95, pvalue_fun = ~style_pvalue(.x, digits = 3))
+```
+
+Refit onto larger dataset
+*notably maintaining the same transforms chosen with the smaller dataset (otherwise at risk of overfitting)*
+```{r}
+# variables of provisional model
+pre_backselection_covar <- c(continuous_variables, categorical_variables)
+provisional_base_coef <- names(mic.provisional$coefficients)
+provisional_base_covar <- unique(str_extract(provisional_base_coef, paste0(pre_backselection_covar, collapse = '|')))
+
+# complete cases for covariates selected in provisional Cox model:
+refit_survival_df <- scaled_winsorised_incomplete_survival_df[, c(provisional_base_covar, 'OverallSurvival_days_capped', 'CensorStatus_day30')]
+# sanity check that subset worked for right number of covariates:
+length(provisional_base_covar)+2 == ncol(refit_survival_df)
+
+refit_survival_df <- refit_survival_df[complete.cases(refit_survival_df), ]
+
+
+# add back non-linear transformations as per mic.provisional$fit above
+refit_formula <- as.formula(paste0('Surv(OverallSurvival_days_capped, CensorStatus_day30) ~ (',
+                            paste(provisional_base_covar[provisional_base_covar %notin% c('monocytes', 'urea')], collapse=" + "), ' + ',
+                            'I((monocytes + 0.1)^-0.5) + log(urea)', ')'))
+
+# refit on larger dataset
+mic.provisional.refit <- mfp(refit_formula,
+                     family = cox,
+                     data = refit_survival_df,
+                     select = 1,           #variate selection significance
+                     alpha = 1,            #fractional polynomial selection significance
+                     method = 'efron',
+                     keep = c("InactiveBaseline"),          #keep variable
+                     verbose = TRUE,
+                     maxits = 20)
+
+# see model coefficients
+mic.provisional.refit$fit %>%
+  tbl_regression(exponentiate = TRUE, conf.level = 0.95, pvalue_fun = ~style_pvalue(.x, digits = 3))
+```
+
+Forward selection 
+```{r}
+output <- add_MFP_term(mic.provisional.refit, 
+                       scaled_winsorised_incomplete_survival_df, 
+                       categorical_variables, 
+                       continuous_variables, 
+                       not_for_scaling) 
+
+output[[1]]
+```
+
+Base effects model
+```{r}
+# new complete cases dataframe
+base_coef <- names(mic.provisional.refit$coefficients)
+base_covar <- unique(str_extract(base_coef, paste0(pre_backselection_covar, collapse = '|')))
+base_covar <- c(base_covar, 'neutrophils', 'sodium', 'RespiratoryRate')
+
+base_survival_df <- scaled_winsorised_incomplete_survival_df[, c(base_covar, 'Ecoli', 'OverallSurvival_days_capped', 'CensorStatus_day30')]
+# sanity check that subset worked for right number of covariates:
+length(base_covar)+2 == ncol(base_survival_df)
+
+base_survival_df <- base_survival_df[complete.cases(base_survival_df), ]
+
+# update formula as indicated 
+base_cox_formula <- update(mic.provisional.refit$formula, .~. +neutrophils +I(neutrophils^0.5) +sodium +RespiratoryRate)
+
+# base effects model 
+mic.base <- mfp(base_cox_formula, 
+                 family = cox,
+                 data = base_survival_df,
+                 select = 1,           #variate selection significance
+                 alpha = 1,            #fractional polynomial selection significance
+                 method = 'efron',
+                 keep = c("InactiveBaseline"),          #keep variable
+                 verbose = FALSE,
+                 maxits = 20)
+
+# see base effects model coefficients
+mic.base$fit %>%
+  tbl_regression(exponentiate = TRUE, conf.level = 0.95, 
+                 estimate_fun = purrr::partial(style_ratio, digits = 3),
+                 pvalue_fun = ~style_pvalue(.x, digits = 3)) 
+```
+
+
